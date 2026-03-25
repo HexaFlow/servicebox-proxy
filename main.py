@@ -136,6 +136,7 @@ class ServiceBoxSession:
         self.user = username
         self.password = password
         self.session = requests.Session()
+        self.session.verify = False  # Corporate VPNs often have SSL inspection
         self.base_url = "https://servicebox.mpsa.com"
 
         auth_str = f"{username}:{password}"
@@ -148,8 +149,10 @@ class ServiceBoxSession:
         })
 
     def bootstrap(self):
+        _log("info", f"Bootstrap avec user={self.user}...", "bootstrap")
         login_url = f"{self.base_url}/agenda/planningReceptionnaire.action"
-        self.session.get(login_url)
+        resp = self.session.get(login_url)
+        _log("info", f"Bootstrap: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
 
     def get_agenda_options(self) -> dict:
         url = f"{self.base_url}/agenda/creerRdv.action"
@@ -694,7 +697,7 @@ def test_connection(creds: Credentials):
     # Test 1: Can we reach servicebox.mpsa.com at all?
     _log("info", "Test de connexion a ServiceBox...", "test")
     try:
-        r = requests.get("https://servicebox.mpsa.com", timeout=10, allow_redirects=False)
+        r = requests.get("https://servicebox.mpsa.com", timeout=10, allow_redirects=False, verify=False)
         # Any HTTP response means the server is reachable (even 401/403)
         result.servicebox_reachable = True
         _log("info", f"Accessible (HTTP {r.status_code})", "test")
