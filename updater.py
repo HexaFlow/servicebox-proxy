@@ -22,7 +22,7 @@ import requests
 from version import VERSION
 
 GITHUB_REPO = "HexaFlow/servicebox-proxy"
-CHECK_INTERVAL_HOURS = 1
+CHECK_INTERVAL_MINUTES = 5
 
 
 def _is_frozen() -> bool:
@@ -122,13 +122,15 @@ del "%~f0"
 
 
 def _background_check_loop():
-    """Runs in a daemon thread, checks periodically."""
+    """Runs in a daemon thread, checks periodically and auto-applies updates."""
     while True:
-        time.sleep(CHECK_INTERVAL_HOURS * 3600)
+        time.sleep(CHECK_INTERVAL_MINUTES * 60)
         release = check_for_update()
         if release:
-            print(f"[updater] Mise a jour disponible: {release['tag_name']}. "
-                  "Elle sera appliquee au prochain redemarrage.")
+            print(f"[updater] Mise a jour detectee: {release['tag_name']}. Application automatique...")
+            if apply_update(release):
+                print("[updater] Mise a jour lancee, arret du processus...")
+                os._exit(0)  # Force exit — the .bat script will restart us
 
 
 def start_update_checker():
