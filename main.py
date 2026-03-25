@@ -19,6 +19,7 @@ from typing import Optional, List
 
 import requests
 import urllib3
+from requests_ntlm import HttpNtlmAuth
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -138,11 +139,9 @@ class ServiceBoxSession:
         self.session = requests.Session()
         self.session.verify = False  # Corporate VPNs often have SSL inspection
         self.base_url = "https://servicebox.mpsa.com"
+        self.auth_method = "unknown"
 
-        auth_str = f"{username}:{password}"
-        self.auth_header = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
         self.session.headers.update({
-            "Authorization": self.auth_header,
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8",
             "Connection": "keep-alive",
@@ -151,8 +150,45 @@ class ServiceBoxSession:
     def bootstrap(self):
         _log("info", f"Bootstrap avec user={self.user}...", "bootstrap")
         login_url = f"{self.base_url}/agenda/planningReceptionnaire.action"
-        resp = self.session.get(login_url)
+
+        # Step 1: Probe without auth to discover WWW-Authenticate scheme
+        _log("info", "Probe sans auth pour decouvrir le schema d'authentification...", "bootstrap")
+        try:
+            probe = requests.get(login_url, verify=False, timeout=15, allow_redirects=False,
+                                 headers={"User-Agent": self.session.headers["User-Agent"]})
+            www_auth = probe.headers.get("WWW-Authenticate", "")
+            _log("info", f"Probe: HTTP {probe.status_code}, WWW-Authenticate: '{www_auth}'", "bootstrap")
+            all_headers = dict(probe.headers)
+            _log("info", f"Probe headers: {json.dumps(all_headers, default=str)}", "bootstrap")
+        except Exception as e:
+            _log("warn", f"Probe echouee: {e}", "bootstrap")
+            www_auth = ""
+
+        # Step 2: Choose auth strategy based on WWW-Authenticate header
+        www_auth_lower = www_auth.lower()
+        if "ntlm" in www_auth_lower or "negotiate" in www_auth_lower:
+            _log("info", f"Schema detecte: NTLM/Negotiate — utilisation de HttpNtlmAuth", "bootstrap")
+            self.session.auth = HttpNtlmAuth(self.user, self.password)
+            self.auth_method = "ntlm"
+        else:
+            _log("info", f"Schema detecte: Basic — utilisation de Basic Auth header", "bootstrap")
+            auth_str = f"{self.user}:{self.password}"
+            self.session.headers["Authorization"] = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
+            self.auth_method = "basic"
+
+        # Step 3: Actual bootstrap request with chosen auth
+        resp = self.session.get(login_url, timeout=30)
         _log("info", f"Bootstrap: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
+        _log("info", f"Auth method: {self.auth_method}", "bootstrap")
+
+        # If Basic failed with 401, try NTLM as fallback
+        if resp.status_code == 401 and self.auth_method == "basic":
+            _log("info", "Basic Auth echoue (401), tentative NTLM en fallback...", "bootstrap")
+            self.session.headers.pop("Authorization", None)
+            self.session.auth = HttpNtlmAuth(self.user, self.password)
+            self.auth_method = "ntlm"
+            resp = self.session.get(login_url, timeout=30)
+            _log("info", f"Bootstrap NTLM: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
 
     def get_agenda_options(self) -> dict:
         url = f"{self.base_url}/agenda/creerRdv.action"

@@ -22,6 +22,8 @@ def main():
         "--hidden-import", "uvicorn.lifespan",
         "--hidden-import", "uvicorn.lifespan.on",
         "--hidden-import", "uvicorn.lifespan.off",
+        "--hidden-import", "requests_ntlm",
+        "--hidden-import", "ntlm_auth",
         "--console",
         "main.py",
     ]
