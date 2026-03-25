@@ -340,6 +340,9 @@ class ServiceBoxSession:
 
         try:
             result = response.json()
+            _log("info", f"Reponse JSON statut={result.get('statut')}", "sauvegarderRdv")
+
+            # Check for validation errors/warnings
             if result.get("statut") == "error":
                 errors = result.get("data", {})
                 msgs = []
@@ -348,14 +351,29 @@ class ServiceBoxSession:
                 for msg in errors.get("globales", []):
                     msgs.append(msg)
                 detail = "; ".join(msgs)
-                _log("error", detail, "sauvegarderRdv")
-                steps.append(StepResult(name="Sauvegarde RDV", status="error", detail=detail))
-                return CreateRdvResponse(success=False, error=detail, steps=steps)
+                _log("warn", f"Validation warnings: {detail}", "sauvegarderRdv")
 
-            retour = result.get("data", {}).get("retour", {})
-            dossier_id = retour.get("diInformations", {}).get("dossierId", "")
-            _log("info", f"OK — dossierId={dossier_id}", "sauvegarderRdv")
-            steps.append(StepResult(name="Sauvegarde RDV", status="ok", detail=f"Dossier {dossier_id}"))
+                # Check if RDV was created despite warnings (dossierId present)
+                retour = errors.get("retour", {}) or result.get("data", {}).get("retour", {})
+                dossier_id = retour.get("diInformations", {}).get("dossierId", "") if retour else ""
+                if not dossier_id:
+                    # Also check at top level of data
+                    dossier_id = result.get("data", {}).get("retour", {}).get("diInformations", {}).get("dossierId", "")
+
+                if dossier_id:
+                    _log("info", f"RDV cree malgre les warnings — dossierId={dossier_id}", "sauvegarderRdv")
+                    steps.append(StepResult(name="Sauvegarde RDV", status="ok", detail=f"Dossier {dossier_id} (warnings: {detail})"))
+                else:
+                    _log("error", f"Echec: {detail}", "sauvegarderRdv")
+                    # Log raw response for debugging
+                    _log("info", f"Raw response: {json.dumps(result, default=str)[:500]}", "sauvegarderRdv")
+                    steps.append(StepResult(name="Sauvegarde RDV", status="error", detail=detail))
+                    return CreateRdvResponse(success=False, error=detail, steps=steps)
+            else:
+                retour = result.get("data", {}).get("retour", {})
+                dossier_id = retour.get("diInformations", {}).get("dossierId", "")
+                _log("info", f"OK — dossierId={dossier_id}", "sauvegarderRdv")
+                steps.append(StepResult(name="Sauvegarde RDV", status="ok", detail=f"Dossier {dossier_id}"))
 
             if not dossier_id:
                 steps.append(StepResult(name="Transfert Alpha", status="skipped", detail="Pas de dossierId"))
