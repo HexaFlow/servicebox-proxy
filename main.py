@@ -10,7 +10,9 @@ import re
 import json
 import random
 import sys
+import time
 import traceback
+from collections import deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Optional, List
@@ -34,6 +36,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── In-memory log ring buffer ────────────────────────────────────────────
+
+_log_entries: deque = deque(maxlen=200)
+
+
+def _log(level: str, message: str, step: str = ""):
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "level": level,
+        "step": step,
+        "message": message,
+    }
+    _log_entries.append(entry)
+    prefix = f"[{step}] " if step else ""
+    print(f"[{level.upper()}] {prefix}{message}")
+
 
 # ─── In-memory session cache (keyed by username) ─────────────────────────
 
@@ -84,16 +103,30 @@ class CreateRdvRequest(Credentials):
     code_pays: str = "FR"
 
 
+class StepResult(BaseModel):
+    name: str
+    status: str  # "ok" | "error" | "skipped"
+    detail: str = ""
+
+
 class CreateRdvResponse(BaseModel):
     success: bool
     or_number: Optional[str] = None
     dossier_id: Optional[str] = None
     error: Optional[str] = None
+    steps: list[StepResult] = []
 
 
 class AgendaOptionsResponse(BaseModel):
     receptionnaires: list[dict]  # [{id, name}]
     equipes: list[dict]          # [{id, name}]
+
+
+class TestConnectionResponse(BaseModel):
+    connected: bool
+    session_ok: bool
+    servicebox_reachable: bool
+    detail: str = ""
 
 
 # ─── ServiceBox Session ──────────────────────────────────────────────────
@@ -170,7 +203,8 @@ class ServiceBoxSession:
         return {"receptionnaires": receptionnaires, "equipes": equipes}
 
     def create_rdv(self, req: CreateRdvRequest) -> CreateRdvResponse:
-        """Create RDV + transfer to Alpha DMS. Returns OR number."""
+        """Create RDV + transfer to Alpha DMS. Returns OR number with step tracking."""
+        steps: list[StepResult] = []
 
         ajax_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -181,22 +215,31 @@ class ServiceBoxSession:
         }
 
         # Step 1: Initialize RDV form
+        _log("info", "Initialisation du formulaire RDV...", "creerRdv")
         resp = self.session.post(
             f"{self.base_url}/agenda/creerRdv.action",
             data={"date": req.date, "heure": req.heure, "receptionnaireId": req.receptionnaire_id},
             headers=ajax_headers,
         )
         if resp.status_code != 200:
-            return CreateRdvResponse(success=False, error=f"creerRdv failed: {resp.status_code}")
+            _log("error", f"Echec HTTP {resp.status_code}", "creerRdv")
+            steps.append(StepResult(name="Initialisation RDV", status="error", detail=f"HTTP {resp.status_code}"))
+            return CreateRdvResponse(success=False, error=f"creerRdv failed: {resp.status_code}", steps=steps)
+        steps.append(StepResult(name="Initialisation RDV", status="ok"))
+        _log("info", "OK", "creerRdv")
 
         # Step 2: Check recall campaigns
+        _log("info", "Verification campagnes rappel...", "campagnes")
         ts = int(datetime.now(timezone.utc).timestamp() * 1000)
         self.session.get(
             f"{self.base_url}/agenda/recupereCampagnes.action",
             params={"vehiculeDto.vin": req.vin, "_": str(ts)},
         )
+        steps.append(StepResult(name="Campagnes rappel", status="ok"))
+        _log("info", "OK", "campagnes")
 
         # Step 3: Save RDV
+        _log("info", "Sauvegarde du RDV...", "sauvegarderRdv")
         reception_dt = f"{req.date}{req.heure}"
         restitution_dt = f"{req.date}{req.restitution_heure}"
 
@@ -216,7 +259,9 @@ class ServiceBoxSession:
         )
 
         if response.status_code != 200:
-            return CreateRdvResponse(success=False, error=f"sauvegarderRdv failed: {response.status_code}")
+            _log("error", f"Echec HTTP {response.status_code}", "sauvegarderRdv")
+            steps.append(StepResult(name="Sauvegarde RDV", status="error", detail=f"HTTP {response.status_code}"))
+            return CreateRdvResponse(success=False, error=f"sauvegarderRdv failed: {response.status_code}", steps=steps)
 
         try:
             result = response.json()
@@ -227,24 +272,42 @@ class ServiceBoxSession:
                     msgs.append(f"[{champ['nom']}]: {', '.join(champ.get('detail', []))}")
                 for msg in errors.get("globales", []):
                     msgs.append(msg)
-                return CreateRdvResponse(success=False, error="; ".join(msgs))
+                detail = "; ".join(msgs)
+                _log("error", detail, "sauvegarderRdv")
+                steps.append(StepResult(name="Sauvegarde RDV", status="error", detail=detail))
+                return CreateRdvResponse(success=False, error=detail, steps=steps)
 
             retour = result.get("data", {}).get("retour", {})
             dossier_id = retour.get("diInformations", {}).get("dossierId", "")
+            _log("info", f"OK — dossierId={dossier_id}", "sauvegarderRdv")
+            steps.append(StepResult(name="Sauvegarde RDV", status="ok", detail=f"Dossier {dossier_id}"))
+
             if not dossier_id:
-                return CreateRdvResponse(success=True, error="RDV cree mais pas de dossierId pour le transfert Alpha")
+                steps.append(StepResult(name="Transfert Alpha", status="skipped", detail="Pas de dossierId"))
+                return CreateRdvResponse(success=True, error="RDV cree mais pas de dossierId pour le transfert Alpha", steps=steps)
 
             # Transfer to Alpha DMS
-            or_number = self._transfer_to_alpha(dossier_id)
-            return CreateRdvResponse(success=True, or_number=or_number, dossier_id=dossier_id)
+            alpha_steps = self._transfer_to_alpha(dossier_id)
+            steps.extend(alpha_steps)
+
+            or_number = None
+            last = alpha_steps[-1] if alpha_steps else None
+            if last and last.status == "ok" and last.name == "Reponse DMS":
+                or_number = last.detail.replace("OR n°", "").strip() if last.detail.startswith("OR") else None
+
+            return CreateRdvResponse(success=True, or_number=or_number, dossier_id=dossier_id, steps=steps)
 
         except (ValueError, KeyError) as e:
-            return CreateRdvResponse(success=False, error=f"Erreur parsing reponse: {e}")
+            _log("error", str(e), "sauvegarderRdv")
+            steps.append(StepResult(name="Sauvegarde RDV", status="error", detail=str(e)))
+            return CreateRdvResponse(success=False, error=f"Erreur parsing reponse: {e}", steps=steps)
 
-    def _transfer_to_alpha(self, dossier_id: str) -> Optional[str]:
-        """Set basket + dmsPutDossier + RelaisServlet + dmsResponse."""
+    def _transfer_to_alpha(self, dossier_id: str) -> list[StepResult]:
+        """Set basket + dmsPutDossier + RelaisServlet + dmsResponse. Returns step results."""
+        steps: list[StepResult] = []
 
-        # Set basket
+        # Step 4: Set basket
+        _log("info", f"Panier → dossier {dossier_id}...", "panier")
         set_url = f"{self.base_url}/panier/panierSetCurrent.do?id={dossier_id}"
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -252,18 +315,30 @@ class ServiceBoxSession:
         }
         resp = self.session.get(set_url, headers=headers)
         if resp.status_code != 200:
-            return None
+            _log("error", f"Echec HTTP {resp.status_code}", "panier")
+            steps.append(StepResult(name="Panier", status="error", detail=f"HTTP {resp.status_code}"))
+            return steps
+        steps.append(StepResult(name="Panier", status="ok"))
+        _log("info", "OK", "panier")
 
-        # Prepare transfer form
+        # Step 5: Prepare transfer
+        _log("info", "Preparation du transfert...", "transfert")
         prepare_url = f"{self.base_url}/panier/panierTransfertPrepare.do?info="
         resp = self.session.get(prepare_url)
         if resp.status_code != 200:
-            return None
+            _log("error", f"Echec HTTP {resp.status_code}", "transfert")
+            steps.append(StepResult(name="Preparation transfert", status="error", detail=f"HTTP {resp.status_code}"))
+            return steps
+        steps.append(StepResult(name="Preparation transfert", status="ok"))
+        _log("info", "OK", "transfert")
 
-        # Parse and post dmsPutDossier
+        # Step 6: dmsPutDossier
+        _log("info", "Envoi dmsPutDossier...", "dmsPut")
         payload = _parse_form_inputs(resp.text, form_id="dmsPutDossier")
         if not payload:
-            return None
+            _log("error", "Formulaire dmsPutDossier introuvable", "dmsPut")
+            steps.append(StepResult(name="DMS Put Dossier", status="error", detail="Formulaire introuvable dans la reponse"))
+            return steps
         payload = [("ajax", "true")] + [(k, v) for k, v in payload if k != "ajax"]
 
         post_headers = {
@@ -279,15 +354,22 @@ class ServiceBoxSession:
             headers=post_headers,
         )
         if resp.status_code != 200:
-            return None
+            _log("error", f"Echec HTTP {resp.status_code}", "dmsPut")
+            steps.append(StepResult(name="DMS Put Dossier", status="error", detail=f"HTTP {resp.status_code}"))
+            return steps
+        steps.append(StepResult(name="DMS Put Dossier", status="ok"))
+        _log("info", "OK", "dmsPut")
 
         dmsput_html = resp.text
 
-        # RelaisServlet
+        # Step 7: RelaisServlet
+        _log("info", "Envoi RelaisServlet (Alpha DMS)...", "relais")
         form_fields = _parse_form_inputs(dmsput_html, form_id="request") or _parse_form_inputs(dmsput_html, form_name="request")
         action_url = _parse_form_action(dmsput_html, form_name="request") or _parse_form_action(dmsput_html, form_id="request")
         if not action_url or not form_fields:
-            return None
+            _log("error", "Formulaire RelaisServlet introuvable", "relais")
+            steps.append(StepResult(name="Relais Alpha", status="error", detail="Formulaire request introuvable"))
+            return steps
 
         relais_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -296,14 +378,21 @@ class ServiceBoxSession:
         }
         resp = self.session.post(action_url, data=form_fields, headers=relais_headers, verify=False)
         if resp.status_code != 200:
-            return None
+            _log("error", f"Echec HTTP {resp.status_code}", "relais")
+            steps.append(StepResult(name="Relais Alpha", status="error", detail=f"HTTP {resp.status_code}"))
+            return steps
+        steps.append(StepResult(name="Relais Alpha", status="ok"))
+        _log("info", "OK", "relais")
 
         relais_html = resp.text
 
-        # dmsResponse
+        # Step 8: dmsResponse
+        _log("info", "Lecture reponse DMS...", "dmsResponse")
         response_fields = _parse_form_inputs(relais_html, form_name="response") or _parse_form_inputs(relais_html, form_id="response")
         if not response_fields:
-            return None
+            _log("error", "Formulaire response introuvable dans la reponse RelaisServlet", "dmsResponse")
+            steps.append(StepResult(name="Reponse DMS", status="error", detail="Formulaire response introuvable"))
+            return steps
 
         fields_dict = dict(response_fields)
         xml_value = fields_dict.get("xml", "")
@@ -335,10 +424,20 @@ class ServiceBoxSession:
             headers=dms_headers,
         )
         if resp.status_code != 200:
-            return None
+            _log("error", f"Echec HTTP {resp.status_code}", "dmsResponse")
+            steps.append(StepResult(name="Reponse DMS", status="error", detail=f"HTTP {resp.status_code}"))
+            return steps
 
         or_match = re.search(r"L'OR\s*n.\s*(\d+)", resp.text)
-        return or_match.group(1) if or_match else None
+        if or_match:
+            or_num = or_match.group(1)
+            _log("info", f"OR n°{or_num}", "dmsResponse")
+            steps.append(StepResult(name="Reponse DMS", status="ok", detail=f"OR n°{or_num}"))
+        else:
+            _log("warn", "Pas de numero OR dans la reponse", "dmsResponse")
+            steps.append(StepResult(name="Reponse DMS", status="ok", detail="Pas de numero OR"))
+
+        return steps
 
     def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str) -> list:
         return [
@@ -576,7 +675,63 @@ def _get_session(creds: Credentials) -> ServiceBoxSession:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": VERSION}
+    return {"status": "ok", "version": VERSION, "sessions": len(_sessions)}
+
+
+@app.get("/logs")
+def get_logs(limit: int = 50):
+    """Return the last N log entries (newest first)."""
+    entries = list(_log_entries)[-limit:]
+    entries.reverse()
+    return {"logs": entries}
+
+
+@app.post("/test-connection", response_model=TestConnectionResponse)
+def test_connection(creds: Credentials):
+    """Test that we can reach ServiceBox and authenticate."""
+    result = TestConnectionResponse(connected=False, session_ok=False, servicebox_reachable=False)
+
+    # Test 1: Can we reach servicebox.mpsa.com at all?
+    _log("info", "Test de connexion a ServiceBox...", "test")
+    try:
+        r = requests.get("https://servicebox.mpsa.com", timeout=10, allow_redirects=False)
+        result.servicebox_reachable = r.status_code in (200, 301, 302, 403)
+        _log("info", f"Accessible (HTTP {r.status_code})", "test")
+    except Exception as e:
+        _log("error", f"Injoignable: {e}", "test")
+        result.detail = f"ServiceBox injoignable: {e}"
+        return result
+
+    if not result.servicebox_reachable:
+        result.detail = "ServiceBox repond mais avec un statut inattendu"
+        return result
+
+    # Test 2: Can we authenticate and get a session?
+    _log("info", "Test d'authentification...", "test")
+    try:
+        session = ServiceBoxSession(creds.username, creds.password)
+        session.bootstrap()
+
+        # Try to load the agenda page — if auth works, we get HTML with our user info
+        test_resp = session.session.get(
+            f"{session.base_url}/agenda/planningReceptionnaire.action",
+            timeout=15,
+        )
+        if test_resp.status_code == 200 and len(test_resp.text) > 500:
+            result.session_ok = True
+            result.connected = True
+            result.detail = "Connexion et authentification OK"
+            _log("info", "Authentification OK", "test")
+            # Cache the session
+            _sessions[creds.username] = session
+        else:
+            result.detail = f"Authentification echouee (HTTP {test_resp.status_code}, {len(test_resp.text)} bytes)"
+            _log("error", result.detail, "test")
+    except Exception as e:
+        result.detail = f"Erreur d'authentification: {e}"
+        _log("error", result.detail, "test")
+
+    return result
 
 
 @app.post("/options", response_model=AgendaOptionsResponse)
