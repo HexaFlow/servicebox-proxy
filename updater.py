@@ -106,7 +106,7 @@ def apply_update(release: dict) -> bool:
     bat_content = f"""@echo off
 timeout /t 2 /nobreak >nul
 del "{current_exe}"
-rename "{update_exe}" "{current_exe.name}"
+move "{update_exe}" "{current_exe}"
 start "" "{current_exe}"
 del "%~f0"
 """
