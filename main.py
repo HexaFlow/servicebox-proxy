@@ -296,9 +296,9 @@ class ServiceBoxSession:
         _log("info", "OK", "campagnes")
 
         # Step 3: Save RDV
-        _log("info", "Sauvegarde du RDV...", "sauvegarderRdv")
         reception_dt = f"{req.date}{req.heure}"
         restitution_dt = f"{req.date}{req.restitution_heure}"
+        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}", "sauvegarderRdv")
 
         save_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -616,7 +616,7 @@ class ServiceBoxSession:
             ("plaDtoList[1].dateHeureRestitution", restitution_dt),
             ("plaDtoList[1].typeRdvCategorie", "2"),
             ("plaDtoList[1].typeRdvId", "2"),
-            ("plaDtoList[1].personnelId", "0"),  # "any available" for restitution
+            ("plaDtoList[1].personnelId", ""),  # empty = no specific CCS for restitution
             ("rdvDto.depasserCapaciteAtelier", ""),
             ("workloadoverrun_oldValName", ""),
             ("rdvMagasinDto.commentaire", ""),
@@ -646,7 +646,7 @@ class ServiceBoxSession:
             ("mobiliteDtoList[0].bookingId", ""), ("mobiliteDtoList[0].bookingKey", ""),
             ("mobiliteDtoList[0].bookingVehSource", ""), ("mobiliteDtoList[0].bookingName", ""),
             ("mobiliteDtoList[0].bookingReferance", ""),
-            ("mobiliteDtoList[0].pretFin.personnelId", "0"),
+            ("mobiliteDtoList[0].pretFin.personnelId", ""),
             ("mobiliteDtoList[0].kmRetourStringValue", ""),
             ("vehiculeBrand-[0]", ""),
             ("mobiliteDtoList[0].etatVehiculeCommentaire", ""),
