@@ -9,6 +9,7 @@ import base64
 import re
 import json
 import random
+import subprocess
 import sys
 import time
 import traceback
@@ -912,36 +913,80 @@ def debug_auth(creds: Credentials):
     except Exception as e:
         results.append({"test": "requests (system proxy)", "result": "error", "detail": str(e)})
 
-    # 5. curl subprocess (uses system certs + proxy like browser)
-    _log("info", "Test avec curl...", "debug")
+    # 5. curl subprocess — uses Windows SChannel (native TLS + cert store like browser)
+    _log("info", "Test avec curl (--ssl-native)...", "debug")
     try:
+        # curl.exe on Windows uses SChannel by default = same TLS as browser
+        # -v for verbose TLS handshake info
         curl_result = subprocess.run(
-            ["curl", "-sk", "-w", "\\n%{http_code}\\n%{size_download}",
+            ["curl.exe", "-sS", "-v", "--ssl-no-revoke",
+             "-w", "\n%{http_code}\n%{size_download}",
              "-u", f"{creds.username}:{creds.password}",
-             "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+             "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
              url],
             capture_output=True, text=True, timeout=20,
         )
         lines = curl_result.stdout.strip().split("\n")
         status = lines[-2] if len(lines) >= 2 else "?"
         size = lines[-1] if len(lines) >= 1 else "?"
-        body_preview = curl_result.stdout[:500] if curl_result.stdout else ""
+        body_preview = curl_result.stdout[:300] if curl_result.stdout else ""
         results.append({
-            "test": "curl",
+            "test": "curl (SChannel)",
             "result": f"HTTP {status}",
-            "detail": f"{size} bytes, body_preview={body_preview[:200]}",
+            "detail": f"{size} bytes, body={body_preview[:200]}",
         })
         _log("info", f"curl: HTTP {status} ({size} bytes)", "debug")
+        # stderr contains verbose TLS handshake details
         if curl_result.stderr:
-            _log("info", f"curl stderr: {curl_result.stderr[:300]}", "debug")
-            results.append({"test": "curl stderr", "result": "info", "detail": curl_result.stderr[:500]})
+            stderr_text = curl_result.stderr[:1000]
+            _log("info", f"curl verbose: {stderr_text}", "debug")
+            results.append({"test": "curl verbose (TLS handshake)", "result": "info", "detail": stderr_text})
     except FileNotFoundError:
-        results.append({"test": "curl", "result": "skip", "detail": "curl not found"})
-        _log("warn", "curl non installe", "debug")
+        results.append({"test": "curl", "result": "skip", "detail": "curl.exe not found"})
+        _log("warn", "curl.exe non trouve", "debug")
     except Exception as e:
         results.append({"test": "curl", "result": "error", "detail": str(e)})
+        _log("error", f"curl: {e}", "debug")
 
-    # 6. Try urllib.request (Python stdlib, uses Windows cert store)
+    # 6. Check for client certificates in Windows cert store
+    _log("info", "Verification certificats client Windows...", "debug")
+    try:
+        certutil_result = subprocess.run(
+            ["certutil", "-user", "-store", "My"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Count certs
+        cert_count = certutil_result.stdout.count("Serial Number:")
+        cert_subjects = re.findall(r"Subject:\s*(.+)", certutil_result.stdout)
+        results.append({
+            "test": "Windows client certs (user store)",
+            "result": f"{cert_count} certs",
+            "detail": "; ".join(cert_subjects[:5]) if cert_subjects else "aucun certificat",
+        })
+        _log("info", f"Client certs: {cert_count} trouves", "debug")
+        for subj in cert_subjects[:5]:
+            _log("info", f"  Cert: {subj}", "debug")
+    except Exception as e:
+        results.append({"test": "Windows client certs", "result": "error", "detail": str(e)})
+
+    # 7. Check machine cert store too
+    try:
+        certutil_result = subprocess.run(
+            ["certutil", "-store", "My"],
+            capture_output=True, text=True, timeout=10,
+        )
+        cert_count = certutil_result.stdout.count("Serial Number:")
+        cert_subjects = re.findall(r"Subject:\s*(.+)", certutil_result.stdout)
+        results.append({
+            "test": "Windows client certs (machine store)",
+            "result": f"{cert_count} certs",
+            "detail": "; ".join(cert_subjects[:5]) if cert_subjects else "aucun certificat",
+        })
+        _log("info", f"Machine certs: {cert_count} trouves", "debug")
+    except Exception as e:
+        results.append({"test": "Windows machine certs", "result": "error", "detail": str(e)})
+
+    # 8. Try urllib.request
     _log("info", "Test avec urllib.request...", "debug")
     try:
         ctx = ssl.create_default_context()
@@ -968,6 +1013,17 @@ def debug_auth(creds: Credentials):
         _log("info", f"urllib: HTTP {e.code}", "debug")
     except Exception as e:
         results.append({"test": "urllib.request", "result": "error", "detail": str(e)})
+
+    # 9. Python TLS version info
+    _log("info", "Info TLS Python...", "debug")
+    try:
+        results.append({
+            "test": "Python TLS",
+            "result": "info",
+            "detail": f"OpenSSL: {ssl.OPENSSL_VERSION}, default protocol: {ssl.PROTOCOL_TLS}",
+        })
+    except Exception as e:
+        results.append({"test": "Python TLS", "result": "error", "detail": str(e)})
 
     return {"results": results}
 
