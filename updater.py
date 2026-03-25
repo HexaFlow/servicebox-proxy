@@ -22,7 +22,7 @@ import requests
 from version import VERSION
 
 GITHUB_REPO = "HexaFlow/servicebox-proxy"
-CHECK_INTERVAL_MINUTES = 5
+CHECK_INTERVAL_MINUTES = 1
 
 
 def _is_frozen() -> bool:
