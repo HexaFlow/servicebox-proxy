@@ -609,7 +609,7 @@ class ServiceBoxSession:
             ("plaDtoList[1].dateHeureRestitution", restitution_dt),
             ("plaDtoList[1].typeRdvCategorie", "2"),
             ("plaDtoList[1].typeRdvId", "2"),
-            ("plaDtoList[1].personnelId", req.receptionnaire_id),
+            ("plaDtoList[1].personnelId", "0"),  # "any available" for restitution
             ("rdvDto.depasserCapaciteAtelier", ""),
             ("workloadoverrun_oldValName", ""),
             ("rdvMagasinDto.commentaire", ""),
@@ -639,7 +639,7 @@ class ServiceBoxSession:
             ("mobiliteDtoList[0].bookingId", ""), ("mobiliteDtoList[0].bookingKey", ""),
             ("mobiliteDtoList[0].bookingVehSource", ""), ("mobiliteDtoList[0].bookingName", ""),
             ("mobiliteDtoList[0].bookingReferance", ""),
-            ("mobiliteDtoList[0].pretFin.personnelId", req.receptionnaire_id),
+            ("mobiliteDtoList[0].pretFin.personnelId", "0"),
             ("mobiliteDtoList[0].kmRetourStringValue", ""),
             ("vehiculeBrand-[0]", ""),
             ("mobiliteDtoList[0].etatVehiculeCommentaire", ""),
