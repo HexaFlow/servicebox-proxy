@@ -97,17 +97,41 @@ def apply_update(release: dict) -> bool:
         return False
 
     # Write a .bat that:
-    #   - waits 2s for us to exit
+    #   - waits for the old process to fully exit (retry until file is deletable)
     #   - deletes old exe
     #   - renames update exe
-    #   - launches new exe
+    #   - launches new exe in a persistent cmd window (stays open on crash)
     #   - deletes itself
     bat_path = current_exe.with_name("_update.bat")
     bat_content = f"""@echo off
-timeout /t 2 /nobreak >nul
-del "{current_exe}"
+echo [updater] Attente de la fermeture du processus...
+timeout /t 3 /nobreak >nul
+
+REM Retry deleting the old exe up to 10 times (in case process hasn't fully exited)
+set retries=0
+:retry_delete
+del "{current_exe}" 2>nul
+if exist "{current_exe}" (
+    set /a retries+=1
+    if %retries% GEQ 10 (
+        echo [updater] ERREUR: impossible de supprimer l'ancien exe apres 10 tentatives
+        pause
+        exit /b 1
+    )
+    timeout /t 1 /nobreak >nul
+    goto retry_delete
+)
+
 move "{update_exe}" "{current_exe}"
-start "" "{current_exe}"
+if errorlevel 1 (
+    echo [updater] ERREUR: impossible de renommer le fichier
+    pause
+    exit /b 1
+)
+
+echo [updater] Lancement de la nouvelle version...
+start "ServiceBox Proxy" cmd /k ""{current_exe}""
+timeout /t 2 /nobreak >nul
 del "%~f0"
 """
     with open(bat_path, "w") as f:
