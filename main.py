@@ -256,6 +256,13 @@ class ServiceBoxSession:
         """Create RDV + transfer to Alpha DMS. Returns OR number with step tracking."""
         steps: list[StepResult] = []
 
+        _log("info", f"=== Creation RDV ===", "creerRdv")
+        _log("info", f"Date: {req.date}, Heure reception: {req.heure}, Heure restitution: {req.restitution_heure}", "creerRdv")
+        _log("info", f"Receptionnaire: {req.receptionnaire_id}, Equipe: {req.equipe_id}", "creerRdv")
+        _log("info", f"Client: {req.prenom} {req.nom}, Tel: {req.tel_mobile}", "creerRdv")
+        _log("info", f"Vehicule: {req.marque_libelle} {req.ldp_libelle}, Immat: {req.immatriculation}, VIN: {req.vin}", "creerRdv")
+        _log("info", f"Travail: {req.travail_nom} ({req.travail_duree}h)", "creerRdv")
+
         ajax_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": self.base_url,
