@@ -297,10 +297,15 @@ class ServiceBoxSession:
 
         # Step 3: Save RDV
         reception_dt = f"{req.date}{req.heure}"
-        # Use reception time for restitution too — the CCS must be available at restitution time,
-        # and we know they're available at reception time. The actual restitution is just planning.
-        restitution_dt = reception_dt
-        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt} (force=reception)", "sauvegarderRdv")
+        # Restitution must be after reception, and CCS must be available.
+        # Use reception + 30min — CCS is guaranteed to still be working.
+        rec_h = int(req.heure[:2])
+        rec_m = int(req.heure[2:])
+        rest_m = rec_m + 30
+        rest_h = rec_h + rest_m // 60
+        rest_m = rest_m % 60
+        restitution_dt = f"{req.date}{rest_h:02d}{rest_m:02d}"
+        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}", "sauvegarderRdv")
 
         save_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
