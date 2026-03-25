@@ -695,15 +695,12 @@ def test_connection(creds: Credentials):
     _log("info", "Test de connexion a ServiceBox...", "test")
     try:
         r = requests.get("https://servicebox.mpsa.com", timeout=10, allow_redirects=False)
-        result.servicebox_reachable = r.status_code in (200, 301, 302, 403)
+        # Any HTTP response means the server is reachable (even 401/403)
+        result.servicebox_reachable = True
         _log("info", f"Accessible (HTTP {r.status_code})", "test")
     except Exception as e:
         _log("error", f"Injoignable: {e}", "test")
         result.detail = f"ServiceBox injoignable: {e}"
-        return result
-
-    if not result.servicebox_reachable:
-        result.detail = "ServiceBox repond mais avec un statut inattendu"
         return result
 
     # Test 2: Can we authenticate and get a session?
@@ -717,6 +714,7 @@ def test_connection(creds: Credentials):
             f"{session.base_url}/agenda/planningReceptionnaire.action",
             timeout=15,
         )
+        _log("info", f"Reponse auth: HTTP {test_resp.status_code} ({len(test_resp.text)} bytes)", "test")
         if test_resp.status_code == 200 and len(test_resp.text) > 500:
             result.session_ok = True
             result.connected = True
@@ -724,6 +722,9 @@ def test_connection(creds: Credentials):
             _log("info", "Authentification OK", "test")
             # Cache the session
             _sessions[creds.username] = session
+        elif test_resp.status_code == 401:
+            result.detail = "Identifiants ServiceBox incorrects (HTTP 401). Verifiez username/password dans les parametres."
+            _log("error", result.detail, "test")
         else:
             result.detail = f"Authentification echouee (HTTP {test_resp.status_code}, {len(test_resp.text)} bytes)"
             _log("error", result.detail, "test")
