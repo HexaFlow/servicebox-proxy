@@ -815,6 +815,163 @@ def reset_session(creds: Credentials):
     return {"status": "ok"}
 
 
+@app.post("/debug-auth")
+def debug_auth(creds: Credentials):
+    """Try every possible auth method and report results for debugging."""
+    import http.client
+    import ssl
+    import socket
+    import urllib.request
+
+    results = []
+    url = "https://servicebox.mpsa.com/agenda/planningReceptionnaire.action"
+    host = "servicebox.mpsa.com"
+    path = "/agenda/planningReceptionnaire.action"
+    auth_str = f"{creds.username}:{creds.password}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+
+    # 0. DNS resolution
+    try:
+        ip = socket.gethostbyname(host)
+        results.append({"test": "DNS", "result": f"ok", "detail": f"{host} -> {ip}"})
+        _log("info", f"DNS: {host} -> {ip}", "debug")
+    except Exception as e:
+        results.append({"test": "DNS", "result": "error", "detail": str(e)})
+
+    # 1. System proxy settings
+    try:
+        proxies = urllib.request.getproxies()
+        results.append({"test": "System proxies", "result": "info", "detail": json.dumps(proxies)})
+        _log("info", f"System proxies: {proxies}", "debug")
+    except Exception as e:
+        results.append({"test": "System proxies", "result": "error", "detail": str(e)})
+
+    # 2. Raw http.client (bypass requests library entirely)
+    _log("info", "Test avec http.client (raw)...", "debug")
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        conn = http.client.HTTPSConnection(host, timeout=15, context=ctx)
+        conn.request("GET", path, headers={
+            "Authorization": f"Basic {b64_auth}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Host": host,
+        })
+        resp = conn.getresponse()
+        body = resp.read()
+        hdrs = dict(resp.getheaders())
+        results.append({
+            "test": "http.client direct",
+            "result": "ok" if resp.status == 200 else f"HTTP {resp.status}",
+            "detail": f"{len(body)} bytes, headers={json.dumps(hdrs)}",
+        })
+        _log("info", f"http.client: HTTP {resp.status} ({len(body)} bytes)", "debug")
+        conn.close()
+    except Exception as e:
+        results.append({"test": "http.client direct", "result": "error", "detail": str(e)})
+        _log("error", f"http.client: {e}", "debug")
+
+    # 3. requests with NO proxy (trust_env=False)
+    _log("info", "Test requests sans proxy...", "debug")
+    try:
+        s = requests.Session()
+        s.trust_env = False
+        s.verify = False
+        r = s.get(url, headers={
+            "Authorization": f"Basic {b64_auth}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }, timeout=15)
+        results.append({
+            "test": "requests (no proxy)",
+            "result": f"HTTP {r.status_code}",
+            "detail": f"{len(r.text)} bytes",
+        })
+        _log("info", f"requests no-proxy: HTTP {r.status_code} ({len(r.text)} bytes)", "debug")
+    except Exception as e:
+        results.append({"test": "requests (no proxy)", "result": "error", "detail": str(e)})
+
+    # 4. requests with explicit system proxy
+    _log("info", "Test requests avec proxy systeme...", "debug")
+    try:
+        proxies = urllib.request.getproxies()
+        s = requests.Session()
+        s.verify = False
+        if proxies:
+            s.proxies.update(proxies)
+        r = s.get(url, headers={
+            "Authorization": f"Basic {b64_auth}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }, timeout=15)
+        results.append({
+            "test": "requests (system proxy)",
+            "result": f"HTTP {r.status_code}",
+            "detail": f"{len(r.text)} bytes, proxies={json.dumps(proxies)}",
+        })
+        _log("info", f"requests system-proxy: HTTP {r.status_code} ({len(r.text)} bytes)", "debug")
+    except Exception as e:
+        results.append({"test": "requests (system proxy)", "result": "error", "detail": str(e)})
+
+    # 5. curl subprocess (uses system certs + proxy like browser)
+    _log("info", "Test avec curl...", "debug")
+    try:
+        curl_result = subprocess.run(
+            ["curl", "-sk", "-w", "\\n%{http_code}\\n%{size_download}",
+             "-u", f"{creds.username}:{creds.password}",
+             "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+             url],
+            capture_output=True, text=True, timeout=20,
+        )
+        lines = curl_result.stdout.strip().split("\n")
+        status = lines[-2] if len(lines) >= 2 else "?"
+        size = lines[-1] if len(lines) >= 1 else "?"
+        body_preview = curl_result.stdout[:500] if curl_result.stdout else ""
+        results.append({
+            "test": "curl",
+            "result": f"HTTP {status}",
+            "detail": f"{size} bytes, body_preview={body_preview[:200]}",
+        })
+        _log("info", f"curl: HTTP {status} ({size} bytes)", "debug")
+        if curl_result.stderr:
+            _log("info", f"curl stderr: {curl_result.stderr[:300]}", "debug")
+            results.append({"test": "curl stderr", "result": "info", "detail": curl_result.stderr[:500]})
+    except FileNotFoundError:
+        results.append({"test": "curl", "result": "skip", "detail": "curl not found"})
+        _log("warn", "curl non installe", "debug")
+    except Exception as e:
+        results.append({"test": "curl", "result": "error", "detail": str(e)})
+
+    # 6. Try urllib.request (Python stdlib, uses Windows cert store)
+    _log("info", "Test avec urllib.request...", "debug")
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Basic {b64_auth}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        })
+        resp = urllib.request.urlopen(req, timeout=15, context=ctx)
+        body = resp.read()
+        results.append({
+            "test": "urllib.request",
+            "result": f"HTTP {resp.status}",
+            "detail": f"{len(body)} bytes",
+        })
+        _log("info", f"urllib: HTTP {resp.status} ({len(body)} bytes)", "debug")
+    except urllib.error.HTTPError as e:
+        results.append({
+            "test": "urllib.request",
+            "result": f"HTTP {e.code}",
+            "detail": f"headers={dict(e.headers)}",
+        })
+        _log("info", f"urllib: HTTP {e.code}", "debug")
+    except Exception as e:
+        results.append({"test": "urllib.request", "result": "error", "detail": str(e)})
+
+    return {"results": results}
+
+
 if __name__ == "__main__":
     import uvicorn
     from updater import start_update_checker
