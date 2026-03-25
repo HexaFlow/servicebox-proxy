@@ -297,15 +297,26 @@ class ServiceBoxSession:
 
         # Step 3: Save RDV
         reception_dt = f"{req.date}{req.heure}"
-        # Restitution must be after reception, and CCS must be available.
-        # Use reception + 30min — CCS is guaranteed to still be working.
+        # Restitution constraints:
+        # - Must be after reception + work duration
+        # - CCS must be available at restitution time
+        # - CCS typically works 8:00–17:00
+        # Strategy: cap work duration to fit within the day, restitution = reception + capped_duration
         rec_h = int(req.heure[:2])
         rec_m = int(req.heure[2:])
-        rest_m = rec_m + 30
-        rest_h = rec_h + rest_m // 60
-        rest_m = rest_m % 60
+        max_restitution_h = 17  # CCS typically available until 17:00
+        available_hours = max(max_restitution_h - rec_h - (rec_m / 60), 1)
+        actual_duration = float(req.travail_duree) if req.travail_duree else 0.5
+        # Cap duration so restitution stays within CCS hours
+        capped_duration = min(actual_duration, available_hours - 0.5)  # 30min buffer
+        capped_duration = max(capped_duration, 0.5)  # at least 30min
+
+        rest_minutes = rec_h * 60 + rec_m + int(capped_duration * 60) + 30  # +30min buffer
+        rest_h = min(rest_minutes // 60, max_restitution_h)
+        rest_m = rest_minutes % 60 if rest_minutes // 60 < max_restitution_h else 0
         restitution_dt = f"{req.date}{rest_h:02d}{rest_m:02d}"
-        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}", "sauvegarderRdv")
+
+        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}, duree_orig={req.travail_duree}h, duree_cap={capped_duration:.2f}h", "sauvegarderRdv")
 
         save_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -315,7 +326,7 @@ class ServiceBoxSession:
             "X-Requested-With": "XMLHttpRequest",
         }
 
-        payload = self._build_rdv_payload(req, reception_dt, restitution_dt)
+        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, f"{capped_duration:.2f}")
         response = self.session.post(
             f"{self.base_url}/agenda/sauvegarderRdv.action",
             data=payload,
@@ -503,7 +514,8 @@ class ServiceBoxSession:
 
         return steps
 
-    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str) -> list:
+    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, capped_duree: str = None) -> list:
+        duree = capped_duree or req.travail_duree
         return [
             ("isAppValidatedAfterDOL", ""),
             ("roleRestituteEnable", "true"),
@@ -593,11 +605,11 @@ class ServiceBoxSession:
             ("rdvTravailDtoList[0].ldtDateModificationTimestamp", ""),
             ("rdvTravailDtoList[0].initial", "true"),
             ("rdvTravailDtoList[0].nom", req.travail_nom),
-            ("rdvTravailDtoList[0].duree", req.travail_duree),
+            ("rdvTravailDtoList[0].duree", duree),
             ("rdvTravailDtoList[0].equipeId", req.equipe_id),
             ("rdvInterventionDtoList[0].equipeId", req.equipe_id),
             ("rdvInterventionDtoList[0].statut", ""),
-            ("rdvInterventionDtoList[0].dureeEstimee", req.travail_duree),
+            ("rdvInterventionDtoList[0].dureeEstimee", duree),
             # RDV flags
             ("rdvDto.entretienRapide", ""), ("rdvDto.mecaniqueLourde", ""),
             ("rdvDto.diagnostic", ""), ("rdvDto.carrosserie", ""),
