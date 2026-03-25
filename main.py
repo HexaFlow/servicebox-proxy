@@ -728,6 +728,50 @@ def health():
     return {"status": "ok", "version": VERSION, "sessions": len(_sessions)}
 
 
+@app.get("/verify-browser")
+def verify_browser():
+    """HTML page to verify ServiceBox credentials in the browser on this machine."""
+    from fastapi.responses import HTMLResponse
+    html = """<!DOCTYPE html>
+<html><head><title>ServiceBox Proxy - Browser Verification</title>
+<style>body{font-family:system-ui;max-width:600px;margin:40px auto;padding:20px}
+button{padding:10px 20px;font-size:16px;cursor:pointer;margin:5px}
+.result{margin-top:20px;padding:15px;border-radius:8px;font-family:monospace;white-space:pre-wrap}
+.ok{background:#F0FDF4;border:1px solid #BBF7D0;color:#166534}
+.err{background:#FEF2F2;border:1px solid #FECACA;color:#991B1B}</style></head>
+<body>
+<h2>ServiceBox Proxy v""" + VERSION + """ - Verification navigateur</h2>
+<p>Ce test verifie si votre navigateur peut se connecter a ServiceBox depuis cette machine.</p>
+<p><strong>Cliquez le bouton ci-dessous.</strong> Si une popup d'authentification apparait,
+entrez vos identifiants ServiceBox (DF09057 / Jeje2523).</p>
+<button onclick="testBrowser()">Tester ServiceBox dans le navigateur</button>
+<button onclick="testFetch()">Tester avec fetch() (comme le proxy)</button>
+<div id="result"></div>
+<script>
+function testBrowser() {
+  document.getElementById('result').innerHTML = '<div class="result">Ouverture de ServiceBox...</div>';
+  window.open('https://servicebox.mpsa.com/agenda/planningReceptionnaire.action', '_blank');
+}
+async function testFetch() {
+  const el = document.getElementById('result');
+  el.innerHTML = '<div class="result">Test en cours...</div>';
+  const user = 'DF09057', pass = 'Jeje2523';
+  const b64 = btoa(user + ':' + pass);
+  try {
+    const r = await fetch('https://servicebox.mpsa.com/agenda/planningReceptionnaire.action', {
+      headers: { 'Authorization': 'Basic ' + b64 },
+    });
+    el.innerHTML = '<div class="result ' + (r.ok ? 'ok' : 'err') + '">fetch(): HTTP ' + r.status + ' (' + r.statusText + ')\\n' +
+      'Content-Length: ' + (r.headers.get('content-length') || '?') + '</div>';
+  } catch(e) {
+    el.innerHTML = '<div class="result err">fetch() error: ' + e.message + '\\n(CORS bloque probablement)</div>';
+  }
+}
+</script>
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
 @app.get("/logs")
 def get_logs(limit: int = 50):
     """Return the last N log entries (newest first)."""
@@ -846,6 +890,95 @@ def debug_auth(creds: Credentials):
         _log("info", f"System proxies: {proxies}", "debug")
     except Exception as e:
         results.append({"test": "System proxies", "result": "error", "detail": str(e)})
+
+    # 1b. Show exact auth header for manual verification
+    results.append({
+        "test": "Auth header sent",
+        "result": "info",
+        "detail": f"Authorization: Basic {b64_auth} (decoded: {creds.username}:{creds.password})",
+    })
+    _log("info", f"Auth header: Basic {b64_auth}", "debug")
+
+    # 1c. WinHTTP proxy settings (separate from WinINET used by browsers)
+    try:
+        winhttp = subprocess.run(
+            ["netsh", "winhttp", "show", "proxy"],
+            capture_output=True, text=True, timeout=5,
+        )
+        results.append({
+            "test": "WinHTTP proxy",
+            "result": "info",
+            "detail": winhttp.stdout.strip(),
+        })
+        _log("info", f"WinHTTP: {winhttp.stdout.strip()}", "debug")
+    except Exception as e:
+        results.append({"test": "WinHTTP proxy", "result": "error", "detail": str(e)})
+
+    # 1d. PowerShell Invoke-WebRequest (.NET/WinHTTP stack — different from everything else)
+    _log("info", "Test avec PowerShell Invoke-WebRequest...", "debug")
+    try:
+        ps_script = (
+            f"$pair = '{creds.username}:{creds.password}'; "
+            f"$bytes = [System.Text.Encoding]::ASCII.GetBytes($pair); "
+            f"$b64 = [System.Convert]::ToBase64String($bytes); "
+            f"$headers = @{{ Authorization = \"Basic $b64\"; 'User-Agent' = 'Mozilla/5.0' }}; "
+            f"try {{ "
+            f"  $r = Invoke-WebRequest -Uri '{url}' -Headers $headers -UseBasicParsing -TimeoutSec 15; "
+            f"  Write-Output \"HTTP $($r.StatusCode) $($r.Content.Length) bytes\" "
+            f"}} catch {{ "
+            f"  $e = $_.Exception; "
+            f"  if ($e.Response) {{ "
+            f"    $code = [int]$e.Response.StatusCode; "
+            f"    Write-Output \"HTTP $code\" "
+            f"  }} else {{ "
+            f"    Write-Output \"ERROR: $($e.Message)\" "
+            f"  }} "
+            f"}}"
+        )
+        ps_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=25,
+        )
+        ps_out = ps_result.stdout.strip()
+        results.append({
+            "test": "PowerShell (.NET)",
+            "result": ps_out or "no output",
+            "detail": ps_result.stderr.strip()[:300] if ps_result.stderr else "",
+        })
+        _log("info", f"PowerShell: {ps_out}", "debug")
+    except Exception as e:
+        results.append({"test": "PowerShell (.NET)", "result": "error", "detail": str(e)})
+
+    # 1e. PowerShell with -UseDefaultCredentials (Windows Integrated Auth / Kerberos)
+    _log("info", "Test PowerShell avec Windows Integrated Auth...", "debug")
+    try:
+        ps_script2 = (
+            f"try {{ "
+            f"  $r = Invoke-WebRequest -Uri '{url}' -UseDefaultCredentials -UseBasicParsing -TimeoutSec 15; "
+            f"  Write-Output \"HTTP $($r.StatusCode) $($r.Content.Length) bytes\" "
+            f"}} catch {{ "
+            f"  $e = $_.Exception; "
+            f"  if ($e.Response) {{ "
+            f"    $code = [int]$e.Response.StatusCode; "
+            f"    Write-Output \"HTTP $code\" "
+            f"  }} else {{ "
+            f"    Write-Output \"ERROR: $($e.Message)\" "
+            f"  }} "
+            f"}}"
+        )
+        ps_result2 = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script2],
+            capture_output=True, text=True, timeout=25,
+        )
+        ps_out2 = ps_result2.stdout.strip()
+        results.append({
+            "test": "PowerShell (Windows Auth)",
+            "result": ps_out2 or "no output",
+            "detail": ps_result2.stderr.strip()[:300] if ps_result2.stderr else "",
+        })
+        _log("info", f"PowerShell WinAuth: {ps_out2}", "debug")
+    except Exception as e:
+        results.append({"test": "PowerShell (Windows Auth)", "result": "error", "detail": str(e)})
 
     # 2. Raw http.client (bypass requests library entirely)
     _log("info", "Test avec http.client (raw)...", "debug")
