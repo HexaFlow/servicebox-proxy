@@ -151,44 +151,54 @@ class ServiceBoxSession:
         _log("info", f"Bootstrap avec user={self.user}...", "bootstrap")
         login_url = f"{self.base_url}/agenda/planningReceptionnaire.action"
 
-        # Step 1: Probe without auth to discover WWW-Authenticate scheme
-        _log("info", "Probe sans auth pour decouvrir le schema d'authentification...", "bootstrap")
-        try:
-            probe = requests.get(login_url, verify=False, timeout=15, allow_redirects=False,
-                                 headers={"User-Agent": self.session.headers["User-Agent"]})
-            www_auth = probe.headers.get("WWW-Authenticate", "")
-            _log("info", f"Probe: HTTP {probe.status_code}, WWW-Authenticate: '{www_auth}'", "bootstrap")
-            all_headers = dict(probe.headers)
-            _log("info", f"Probe headers: {json.dumps(all_headers, default=str)}", "bootstrap")
-        except Exception as e:
-            _log("warn", f"Probe echouee: {e}", "bootstrap")
-            www_auth = ""
+        # Strategy: mimic exact browser behavior
+        # 1. Hit URL with session (no auth) — BigIP returns 401 + may set tracking cookies
+        # 2. Resend same URL with Basic Auth on same session (cookies preserved)
+        # This is exactly what browsers do with Basic Auth.
 
-        # Step 2: Choose auth strategy based on WWW-Authenticate header
-        www_auth_lower = www_auth.lower()
-        if "ntlm" in www_auth_lower or "negotiate" in www_auth_lower:
-            _log("info", f"Schema detecte: NTLM/Negotiate — utilisation de HttpNtlmAuth", "bootstrap")
-            self.session.auth = HttpNtlmAuth(self.user, self.password)
-            self.auth_method = "ntlm"
-        else:
-            _log("info", f"Schema detecte: Basic — utilisation de Basic Auth header", "bootstrap")
-            auth_str = f"{self.user}:{self.password}"
-            self.session.headers["Authorization"] = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
-            self.auth_method = "basic"
+        _log("info", "Etape 1: requete initiale sans auth (challenge BigIP)...", "bootstrap")
+        challenge_resp = self.session.get(login_url, timeout=15, allow_redirects=False)
+        www_auth = challenge_resp.headers.get("WWW-Authenticate", "")
+        _log("info", f"Challenge: HTTP {challenge_resp.status_code}, WWW-Authenticate: '{www_auth}'", "bootstrap")
+        _log("info", f"Challenge cookies: {list(self.session.cookies.keys())}", "bootstrap")
+        _log("info", f"Challenge headers: {json.dumps(dict(challenge_resp.headers), default=str)}", "bootstrap")
 
-        # Step 3: Actual bootstrap request with chosen auth
+        # 2. Now send with Basic Auth (session retains any cookies from step 1)
+        _log("info", "Etape 2: requete avec Basic Auth...", "bootstrap")
+        auth_str = f"{self.user}:{self.password}"
+        auth_header = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
+        self.session.headers["Authorization"] = auth_header
+        self.auth_method = "basic"
+
         resp = self.session.get(login_url, timeout=30)
-        _log("info", f"Bootstrap: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
-        _log("info", f"Auth method: {self.auth_method}", "bootstrap")
+        _log("info", f"Bootstrap Basic: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
+        _log("info", f"Response headers: {json.dumps(dict(resp.headers), default=str)}", "bootstrap")
 
-        # If Basic failed with 401, try NTLM as fallback
-        if resp.status_code == 401 and self.auth_method == "basic":
-            _log("info", "Basic Auth echoue (401), tentative NTLM en fallback...", "bootstrap")
+        # If Basic fails, try NTLM
+        if resp.status_code == 401:
+            _log("info", "Basic echoue, tentative NTLM...", "bootstrap")
             self.session.headers.pop("Authorization", None)
             self.session.auth = HttpNtlmAuth(self.user, self.password)
             self.auth_method = "ntlm"
             resp = self.session.get(login_url, timeout=30)
             _log("info", f"Bootstrap NTLM: HTTP {resp.status_code} ({len(resp.text)} bytes, cookies={list(self.session.cookies.keys())})", "bootstrap")
+
+        # If still 401, try with domain prefix variants
+        if resp.status_code == 401:
+            for domain in ["MPSA", "STELLANTIS", "PSA", "GROUPE-PSA"]:
+                _log("info", f"Tentative avec domaine {domain}\\{self.user}...", "bootstrap")
+                self.session.headers.pop("Authorization", None)
+                self.session.auth = None
+                domain_user = f"{domain}\\{self.user}"
+                auth_str = f"{domain_user}:{self.password}"
+                self.session.headers["Authorization"] = f"Basic {base64.b64encode(auth_str.encode()).decode()}"
+                self.auth_method = f"basic+{domain}"
+                resp = self.session.get(login_url, timeout=30)
+                _log("info", f"Bootstrap {domain}: HTTP {resp.status_code} ({len(resp.text)} bytes)", "bootstrap")
+                if resp.status_code != 401:
+                    break
+
+        _log("info", f"Auth method final: {self.auth_method}", "bootstrap")
 
     def get_agenda_options(self) -> dict:
         url = f"{self.base_url}/agenda/creerRdv.action"
