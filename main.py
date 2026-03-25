@@ -297,8 +297,10 @@ class ServiceBoxSession:
 
         # Step 3: Save RDV
         reception_dt = f"{req.date}{req.heure}"
-        restitution_dt = f"{req.date}{req.restitution_heure}"
-        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}", "sauvegarderRdv")
+        # Use reception time for restitution too — the CCS must be available at restitution time,
+        # and we know they're available at reception time. The actual restitution is just planning.
+        restitution_dt = reception_dt
+        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt} (force=reception)", "sauvegarderRdv")
 
         save_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -616,7 +618,7 @@ class ServiceBoxSession:
             ("plaDtoList[1].dateHeureRestitution", restitution_dt),
             ("plaDtoList[1].typeRdvCategorie", "2"),
             ("plaDtoList[1].typeRdvId", "2"),
-            ("plaDtoList[1].personnelId", ""),  # empty = no specific CCS for restitution
+            ("plaDtoList[1].personnelId", req.receptionnaire_id),
             ("rdvDto.depasserCapaciteAtelier", ""),
             ("workloadoverrun_oldValName", ""),
             ("rdvMagasinDto.commentaire", ""),
@@ -646,7 +648,7 @@ class ServiceBoxSession:
             ("mobiliteDtoList[0].bookingId", ""), ("mobiliteDtoList[0].bookingKey", ""),
             ("mobiliteDtoList[0].bookingVehSource", ""), ("mobiliteDtoList[0].bookingName", ""),
             ("mobiliteDtoList[0].bookingReferance", ""),
-            ("mobiliteDtoList[0].pretFin.personnelId", ""),
+            ("mobiliteDtoList[0].pretFin.personnelId", req.receptionnaire_id),
             ("mobiliteDtoList[0].kmRetourStringValue", ""),
             ("vehiculeBrand-[0]", ""),
             ("mobiliteDtoList[0].etatVehiculeCommentaire", ""),
