@@ -6,12 +6,14 @@ with ServiceBox + Alpha DMS.
 """
 
 import base64
+import ctypes
 import re
 import json
 import random
 import subprocess
 import sys
 import time
+import threading
 import traceback
 from collections import deque
 from datetime import datetime, timezone
@@ -746,6 +748,40 @@ def _get_session(creds: Credentials) -> ServiceBoxSession:
         s.bootstrap()
         _sessions[key] = s
     return _sessions[key]
+
+
+# ─── Session keep-alive (prevent Windows/RDP inactivity disconnect) ──────
+
+# Simulate a harmless key press (F15 — exists in the HID spec but no
+# physical key on any keyboard, so it won't interfere with anything).
+# This resets the Windows idle timer, preventing:
+#   - Screen lock
+#   - RDP/VPN session disconnect due to inactivity
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+SESSION_KEEPALIVE_INTERVAL = 60  # seconds
+
+
+def _session_keepalive_loop():
+    """Prevent the Windows session from going idle by poking the OS every minute."""
+    while True:
+        time.sleep(SESSION_KEEPALIVE_INTERVAL)
+        try:
+            # Tell Windows the system is not idle (prevents sleep + screen lock)
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+            _log("debug", "Session keep-alive: execution state reset", "keepalive")
+        except Exception as e:
+            _log("error", f"Session keep-alive failed: {e}", "keepalive")
+
+
+_session_keepalive_thread = threading.Thread(target=_session_keepalive_loop, daemon=True)
+_session_keepalive_thread.start()
+_log("info", f"Session keep-alive started (every {SESSION_KEEPALIVE_INTERVAL}s)", "keepalive")
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────
