@@ -335,8 +335,8 @@ class ServiceBoxSession:
                 _log("info", "Pas de champ xml dans la reponse DMS", "rechercheClient")
                 return None
 
-            from urllib.parse import unquote
-            xml_data = unquote(xml_match.group(1))
+            from urllib.parse import unquote_plus
+            xml_data = unquote_plus(xml_match.group(1))
             _log("info", f"XML DMS: {xml_data[:500]}", "rechercheClient")
 
             # Parse CLIENT elements
