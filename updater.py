@@ -226,11 +226,10 @@ powershell -Command "Unblock-File -Path '{current_exe}'" >nul 2>&1
 
 echo [bat] Fichier renomme OK. Lancement... >> "{log_file}"
 
-REM Launch the new exe and capture any crash output to log
-"{current_exe}" >> "{log_file}" 2>&1
-echo [bat] Le processus s'est termine avec code: %errorlevel% >> "{log_file}"
-echo [bat] Si vous voyez ceci, le proxy a crashe. >> "{log_file}"
-pause
+REM Launch the new exe as a fully independent process via PowerShell Start-Process
+powershell -Command "Start-Process -FilePath '{current_exe}'" >> "{log_file}" 2>&1
+echo [bat] Start-Process termine avec code: %errorlevel% >> "{log_file}"
+timeout /t 3 /nobreak >nul
 del "%~f0"
 """
     with open(bat_path, "w") as f:
