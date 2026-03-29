@@ -226,9 +226,10 @@ powershell -Command "Unblock-File -Path '{current_exe}'" >nul 2>&1
 
 echo [bat] Fichier renomme OK. Lancement... >> "{log_file}"
 
-REM Launch the new exe as a fully independent process via PowerShell Start-Process
-powershell -Command "Start-Process -FilePath '{current_exe}'" >> "{log_file}" 2>&1
-echo [bat] Start-Process termine avec code: %errorlevel% >> "{log_file}"
+REM Launch the new exe via explorer.exe (same as double-clicking)
+echo [bat] Lancement via explorer.exe... >> "{log_file}"
+explorer.exe "{current_exe}"
+echo [bat] explorer.exe lance avec code: %errorlevel% >> "{log_file}"
 timeout /t 3 /nobreak >nul
 del "%~f0"
 """
