@@ -27,13 +27,20 @@ jobs:
       - name: Build .exe
         run: python build.py
 
-      - name: Rename exe to generic name
+      - name: Rename exe and compute hash
         run: |
           $version = python -c "from version import VERSION; print(VERSION)"
           Move-Item "dist/servicebox-proxy-$version.exe" "dist/servicebox-proxy.exe"
+          $hash = (Get-FileHash "dist/servicebox-proxy.exe" -Algorithm SHA256).Hash
+          $size = (Get-Item "dist/servicebox-proxy.exe").Length
+          echo "SHA256: $hash"
+          echo "Size: $size bytes"
+          echo "$hash" > "dist/servicebox-proxy.exe.sha256"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/servicebox-proxy.exe
+          files: |
+            dist/servicebox-proxy.exe
+            dist/servicebox-proxy.exe.sha256
           generate_release_notes: true

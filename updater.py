@@ -9,6 +9,7 @@ On Windows you can't overwrite a running .exe, so the strategy is:
   3. Exit the current process — the .bat takes over
 """
 
+import hashlib
 import os
 import sys
 import subprocess
@@ -143,6 +144,31 @@ def apply_update(release: dict) -> bool:
         _log(f"ERREUR: taille ne correspond pas (diff: {actual_size - expected_size}), fichier corrompu")
         update_exe.unlink(missing_ok=True)
         return False
+
+    # Compute SHA256 for debugging
+    sha = hashlib.sha256(open(update_exe, "rb").read()).hexdigest()
+    _log(f"SHA256 du fichier telecharge: {sha}")
+
+    # Try to download and verify against .sha256 file from release
+    sha_asset = None
+    for a in release.get("assets", []):
+        if a.get("name", "").endswith(".sha256"):
+            sha_asset = a
+            break
+    if sha_asset:
+        try:
+            sha_resp = requests.get(sha_asset["browser_download_url"], timeout=10)
+            expected_sha = sha_resp.text.strip().upper()
+            _log(f"SHA256 attendu: {expected_sha}")
+            if sha.upper() != expected_sha:
+                _log("ERREUR: SHA256 ne correspond pas! Fichier corrompu.")
+                update_exe.unlink(missing_ok=True)
+                return False
+            _log("SHA256 OK - fichier intact")
+        except Exception as e:
+            _log(f"Impossible de verifier SHA256: {e}")
+    else:
+        _log("Pas de fichier .sha256 dans la release, verification impossible")
 
     # Remove Windows "downloaded from internet" marker that can block DLL extraction
     try:
