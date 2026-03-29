@@ -169,7 +169,7 @@ if errorlevel 1 (
 )
 
 echo [updater] Lancement de la nouvelle version... >> "{log_file}"
-start "" "{current_exe}"
+start "ServiceBox Proxy" cmd /k ""{current_exe}""
 timeout /t 2 /nobreak >nul
 del "%~f0"
 """
