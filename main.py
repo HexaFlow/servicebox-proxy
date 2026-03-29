@@ -282,7 +282,9 @@ class ServiceBoxSession:
                     headers=ajax_headers,
                 )
                 if resp.status_code == 200:
+                    _log("info", f"Reponse recherche tel ({len(resp.text)} bytes): {resp.text[:500]}", "rechercheClient")
                     results = self._parse_client_search(resp.text)
+                    _log("info", f"Resultats parses: {len(results)} client(s)", "rechercheClient")
                     if results:
                         _log("info", f"Client trouve par tel: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
                         return results[0]
@@ -299,7 +301,9 @@ class ServiceBoxSession:
                     headers=ajax_headers,
                 )
                 if resp.status_code == 200:
+                    _log("info", f"Reponse recherche nom ({len(resp.text)} bytes): {resp.text[:500]}", "rechercheClient")
                     results = self._parse_client_search(resp.text)
+                    _log("info", f"Resultats parses: {len(results)} client(s)", "rechercheClient")
                     if results:
                         _log("info", f"Client trouve par nom: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
                         return results[0]
