@@ -275,23 +275,8 @@ class ServiceBoxSession:
                 return None
             _log("info", f"RelaisServlet: {relais_url}", "rechercheClient")
 
-            # Try phone search with different formats
             if clean_phone and len(clean_phone) >= 6:
-                # Try full phone number first (10 digits)
-                result = self._dms_search(relais_url, code_interrogation="6", search_value=clean_phone)
-                if result:
-                    return result
-
-                # Try without leading 0 (e.g. 651022462)
-                if clean_phone.startswith("0") and len(clean_phone) >= 10:
-                    result = self._dms_search(relais_url, code_interrogation="6", search_value=clean_phone[1:])
-                    if result:
-                        return result
-
-            # Fallback: search by name (CODE_INTERROGATION=1)
-            if nom:
-                _log("info", f"Recherche client par nom: {nom}", "rechercheClient")
-                result = self._dms_search(relais_url, code_interrogation="1", search_value=nom.upper())
+                result = self._dms_search(relais_url, code_interrogation="1", search_value=clean_phone)
                 if result:
                     return result
 
@@ -342,6 +327,7 @@ class ServiceBoxSession:
 
             dms_response_html = relais_resp.text
             _log("info", f"Reponse DMS ({len(dms_response_html)} bytes)", "rechercheClient")
+            _log("info", f"Raw DMS response: {dms_response_html[:500]}", "rechercheClient")
 
             # Parse CLIENT elements from the DMS XML response
             xml_match = re.search(r'name="xml"\s+value="([^"]*)"', dms_response_html)
