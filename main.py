@@ -324,7 +324,17 @@ class ServiceBoxSession:
             return CreateRdvResponse(success=False, error=f"sauvegarderRdv failed: {response.status_code}", steps=steps)
 
         try:
-            result = response.json()
+            # ServiceBox may return JSON with invalid backslash escapes (e.g. Windows paths)
+            # Fix them before parsing
+            raw_text = response.text
+            try:
+                result = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # Replace invalid \escapes: turn lone backslashes into double backslashes
+                # but preserve valid JSON escapes like \n \t \r \\ \" \/ \uXXXX
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw_text)
+                result = json.loads(fixed)
+                _log("warn", "Response contained invalid JSON escapes — auto-fixed", "sauvegarderRdv")
             _log("info", f"Reponse JSON statut={result.get('statut')}", "sauvegarderRdv")
 
             # Check for validation errors/warnings
