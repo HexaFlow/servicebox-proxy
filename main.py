@@ -1134,6 +1134,38 @@ def create_rdv(req: CreateRdvRequest):
         return CreateRdvResponse(success=False, error=str(e))
 
 
+class SearchClientRequest(Credentials):
+    phone: str = ""
+    nom: str = ""
+
+
+class SearchClientResponse(BaseModel):
+    found: bool
+    dms_id: Optional[str] = None
+    nom: Optional[str] = None
+    prenom: Optional[str] = None
+    detail: str = ""
+
+
+@app.post("/search-client", response_model=SearchClientResponse)
+def search_client(req: SearchClientRequest):
+    try:
+        session = _get_session(req)
+        result = session._search_client_dms(req.phone, nom=req.nom)
+        if result:
+            return SearchClientResponse(
+                found=True,
+                dms_id=result["dms_id"],
+                nom=result["nom"],
+                prenom=result["prenom"],
+                detail=f"Client DMS: {result['prenom']} {result['nom']} (id={result['dms_id']})",
+            )
+        return SearchClientResponse(found=False, detail="Aucun client trouve")
+    except Exception as e:
+        traceback.print_exc()
+        return SearchClientResponse(found=False, detail=str(e))
+
+
 class DeleteRdvRequest(Credentials):
     rdv_id: str
 
