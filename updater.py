@@ -111,26 +111,56 @@ def apply_update(release: dict) -> bool:
     update_exe = current_exe.with_name(current_exe.stem + "_update.exe")
     log_file = current_exe.with_name("_update_log.txt")
 
-    _log(f"Telechargement {release['tag_name']} depuis {asset['name']} ...")
+    expected_size = asset.get("size", 0)
+    _log(f"Telechargement {release['tag_name']} depuis {asset['name']} (taille attendue: {expected_size}) ...")
     try:
         resp = requests.get(download_url, timeout=120, stream=True)
         resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
+        content_type = resp.headers.get("content-type", "unknown")
+        _log(f"Content-Type: {content_type}")
+        if "text/html" in content_type:
+            _log("ERREUR: recu du HTML au lieu du binaire, URL incorrecte?")
+            return False
         downloaded = 0
         with open(update_exe, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
         _log(f"Telechargement termine: {downloaded} octets")
     except Exception as e:
         _log(f"Echec du telechargement: {e}")
         return False
 
-    # Verify downloaded file is not empty / corrupt
-    if not update_exe.exists() or update_exe.stat().st_size < 1_000_000:
-        _log(f"Fichier telecharge trop petit ({update_exe.stat().st_size} octets), update annule")
+    # Verify downloaded file size matches expected
+    actual_size = update_exe.stat().st_size if update_exe.exists() else 0
+    _log(f"Taille sur disque: {actual_size} octets (attendu: {expected_size})")
+    if actual_size < 1_000_000:
+        _log(f"Fichier trop petit, update annule")
         update_exe.unlink(missing_ok=True)
         return False
+    if expected_size and abs(actual_size - expected_size) > 1000:
+        _log(f"ERREUR: taille ne correspond pas (diff: {actual_size - expected_size}), fichier corrompu")
+        update_exe.unlink(missing_ok=True)
+        return False
+
+    # Remove Windows "downloaded from internet" marker that can block DLL extraction
+    try:
+        zone_id = str(update_exe) + ":Zone.Identifier"
+        if os.path.exists(zone_id):
+            os.remove(zone_id)
+            _log("Zone.Identifier supprime")
+    except Exception:
+        pass
+    # Also try PowerShell Unblock-File
+    try:
+        subprocess.run(
+            ["powershell", "-Command", f"Unblock-File -Path '{update_exe}'"],
+            timeout=5, capture_output=True,
+        )
+        _log("Unblock-File execute")
+    except Exception:
+        pass
 
     # Write a .bat that:
     #   - logs everything to _update_log.txt for debugging
