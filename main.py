@@ -256,112 +256,161 @@ class ServiceBoxSession:
 
         return {"receptionnaires": receptionnaires, "equipes": equipes}
 
-    def _search_client(self, phone: str, nom: str) -> dict | None:
-        """Search for an existing client by phone number, then by name.
-        Returns {"id": ..., "nom": ..., "prenom": ...} or None.
+    def _search_client_dms(self, phone: str) -> dict | None:
+        """Search for an existing client via Alpha DMS RelaisServlet by phone number.
+        Returns {"dms_id": ..., "nom": ..., "prenom": ...} or None.
+        Uses the same DMS relay flow as the browser:
+        1. POST to RelaisServlet with phone search XML (CODE_INTERROGATION=6)
+        2. Parse CLIENT elements from the DMS response
+        3. POST to dmsClientVehiculeSelection.action to select the client in the SB session
         """
-        if not phone and not nom:
+        if not phone:
             return None
 
-        ajax_headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/agenda/planningReceptionnaire.action?jbnRedirect=true",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        clean_phone = re.sub(r"[^0-9]", "", phone)
+        if len(clean_phone) < 6:
+            return None
 
-        # Try phone search first (most precise)
-        if phone:
-            clean_phone = re.sub(r"[^0-9]", "", phone)
-            _log("info", f"Recherche client par tel: {clean_phone}", "rechercheClient")
-            try:
-                resp = self.session.post(
-                    f"{self.base_url}/agenda/rechercheClient.action",
-                    data={"clientDto.telMobile": clean_phone, "isRdvCreation": "true"},
-                    headers=ajax_headers,
-                )
-                if resp.status_code == 200:
-                    _log("info", f"Reponse recherche tel ({len(resp.text)} bytes): {resp.text[:500]}", "rechercheClient")
-                    results = self._parse_client_search(resp.text)
-                    _log("info", f"Resultats parses: {len(results)} client(s)", "rechercheClient")
-                    if results:
-                        _log("info", f"Client trouve par tel: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
-                        return results[0]
-            except Exception as e:
-                _log("warn", f"Recherche client par tel echouee: {e}", "rechercheClient")
+        _log("info", f"Recherche client DMS par tel: {clean_phone}", "rechercheClient")
 
-        # Try name search as fallback
-        if nom:
-            _log("info", f"Recherche client par nom: {nom}", "rechercheClient")
-            try:
-                resp = self.session.post(
-                    f"{self.base_url}/agenda/rechercheClient.action",
-                    data={"clientDto.nom": nom, "isRdvCreation": "true"},
-                    headers=ajax_headers,
-                )
-                if resp.status_code == 200:
-                    _log("info", f"Reponse recherche nom ({len(resp.text)} bytes): {resp.text[:500]}", "rechercheClient")
-                    results = self._parse_client_search(resp.text)
-                    _log("info", f"Resultats parses: {len(results)} client(s)", "rechercheClient")
-                    if results:
-                        _log("info", f"Client trouve par nom: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
-                        return results[0]
-            except Exception as e:
-                _log("warn", f"Recherche client par nom echouee: {e}", "rechercheClient")
-
-        _log("info", "Aucun client existant trouve, un nouveau sera cree", "rechercheClient")
-        return None
-
-    def _parse_client_search(self, html: str) -> list[dict]:
-        """Parse client search results from ServiceBox HTML response.
-        Returns list of {id, nom, prenom, tel_mobile} dicts.
-        """
-        clients = []
-        # ServiceBox returns a table or JSON with client results
-        # Try JSON first
         try:
-            data = json.loads(html)
-            if isinstance(data, list):
-                for item in data:
-                    client_id = str(item.get("id", item.get("clientId", "")))
-                    if client_id:
-                        clients.append({
-                            "id": client_id,
-                            "nom": item.get("nom", ""),
-                            "prenom": item.get("prenom", ""),
-                            "tel_mobile": item.get("telMobile", ""),
-                        })
-                return clients
-            elif isinstance(data, dict) and data.get("data"):
-                items = data["data"] if isinstance(data["data"], list) else [data["data"]]
-                for item in items:
-                    client_id = str(item.get("id", item.get("clientId", "")))
-                    if client_id:
-                        clients.append({
-                            "id": client_id,
-                            "nom": item.get("nom", ""),
-                            "prenom": item.get("prenom", ""),
-                            "tel_mobile": item.get("telMobile", ""),
-                        })
-                return clients
-        except (json.JSONDecodeError, ValueError):
-            pass
+            # Step 1: We need the RelaisServlet URL and PARAMDMS.
+            # Get them from the dmsPutDossier form (same as transfer flow).
+            # But since we haven't created a dossier yet, we need the DMS relay URL
+            # from the agenda page. Use a simpler approach: call the same RelaisServlet
+            # that the browser uses.
 
-        # Try HTML table parsing — look for rows with client data
-        rows = re.findall(
-            r'onclick="[^"]*selectionnerClient\((\d+)[^"]*"[^>]*>.*?<td[^>]*>(.*?)</td>.*?<td[^>]*>(.*?)</td>',
-            html, re.DOTALL,
-        )
-        for client_id, col1, col2 in rows:
-            clients.append({
-                "id": client_id,
-                "nom": re.sub(r"<[^>]+>", "", col1).strip(),
-                "prenom": re.sub(r"<[^>]+>", "", col2).strip(),
-                "tel_mobile": "",
-            })
+            # Build the DMS search XML — CODE_INTERROGATION=6 is phone search
+            # Truncate to 8 digits (ServiceBox behavior)
+            search_phone = clean_phone[:8] if len(clean_phone) > 8 else clean_phone
+            dms_xml = (
+                f'<DMS TYPE = "01" CODE_INTERROGATION = "6" '
+                f'CHAMPS_CMPL = "{search_phone}" '
+                f'NumeroPoste = "@P@" '
+                f'PARAMDMS = "R:CIT" '
+                f'></DMS>'
+            )
 
-        return clients
+            from urllib.parse import quote as url_quote
+            encoded_xml = url_quote(url_quote(dms_xml, safe=""))
+
+            # We need the RelaisServlet URL — it's site-specific.
+            # Extract it from the agenda page by looking for the DMS config.
+            relais_url = self._get_relais_url()
+            if not relais_url:
+                _log("warn", "Impossible de trouver l'URL RelaisServlet", "rechercheClient")
+                return None
+
+            _log("info", f"RelaisServlet: {relais_url}", "rechercheClient")
+
+            relais_headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.base_url,
+                "Accept": "text/plain, */*; q=0.01",
+            }
+            relais_resp = self.session.post(
+                relais_url,
+                data={
+                    "ajax": "true",
+                    "NumeroPoste": "@P@",
+                    "PARAMDMS": "R:CIT",
+                    "urlResp": "dummy",
+                    "xml": encoded_xml,
+                },
+                headers=relais_headers,
+                verify=False,
+            )
+
+            if relais_resp.status_code != 200:
+                _log("warn", f"RelaisServlet HTTP {relais_resp.status_code}", "rechercheClient")
+                return None
+
+            dms_response_html = relais_resp.text
+            _log("info", f"Reponse DMS ({len(dms_response_html)} bytes)", "rechercheClient")
+
+            # Step 2: Parse CLIENT elements from the DMS XML response
+            # The response is an HTML form containing URL-encoded XML in a hidden field
+            xml_match = re.search(r'name="xml"\s+value="([^"]*)"', dms_response_html)
+            if not xml_match:
+                _log("info", "Pas de champ xml dans la reponse DMS", "rechercheClient")
+                return None
+
+            from urllib.parse import unquote
+            xml_data = unquote(xml_match.group(1))
+            _log("info", f"XML DMS: {xml_data[:300]}", "rechercheClient")
+
+            # Parse CLIENT elements
+            clients = re.findall(
+                r'<CLIENT\s+([^>]+)/?>',
+                xml_data,
+            )
+            if not clients:
+                _log("info", "Aucun CLIENT dans la reponse DMS", "rechercheClient")
+                return None
+
+            # Parse first client's attributes
+            first_client_attrs = clients[0]
+            dms_id = re.search(r'CLIENT_DMS_ID\s*=\s*"([^"]*)"', first_client_attrs)
+            nom = re.search(r'Nom\s*=\s*"([^"]*)"', first_client_attrs)
+            prenom = re.search(r'Prenom\s*=\s*"([^"]*)"', first_client_attrs)
+
+            if not dms_id:
+                _log("warn", "CLIENT_DMS_ID introuvable", "rechercheClient")
+                return None
+
+            client = {
+                "dms_id": dms_id.group(1),
+                "nom": nom.group(1) if nom else "",
+                "prenom": prenom.group(1) if prenom else "",
+            }
+            _log("info", f"Client DMS trouve: id={client['dms_id']}, {client['prenom']} {client['nom']} ({len(clients)} resultats)", "rechercheClient")
+
+            # Step 3: Select this client in ServiceBox session
+            _log("info", "Selection du client dans ServiceBox...", "rechercheClient")
+            select_resp = self.session.post(
+                f"{self.base_url}/agenda/dmsClientVehiculeSelection.action",
+                data={
+                    "champId": "tel-2",
+                    "dmsReponse": dms_response_html,
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": self.base_url,
+                    "Referer": f"{self.base_url}/agenda/?tabControlID=&jbnContext=true",
+                    "Accept": "text/html, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            _log("info", f"dmsClientVehiculeSelection: HTTP {select_resp.status_code}", "rechercheClient")
+
+            return client
+
+        except Exception as e:
+            _log("warn", f"Recherche client DMS echouee: {e}", "rechercheClient")
+            return None
+
+    def _get_relais_url(self) -> str | None:
+        """Extract the RelaisServlet URL from the agenda page config."""
+        # The RelaisServlet URL is typically in a JS variable or hidden field
+        # Try fetching the agenda page and parsing it
+        try:
+            resp = self.session.get(
+                f"{self.base_url}/agenda/?tabControlID=&jbnContext=true",
+                headers={"Accept": "text/html"},
+            )
+            if resp.status_code != 200:
+                return None
+            # Look for RelaisServlet URL pattern
+            match = re.search(r'(https?://[^"\']+/eDMS/RelaisServlet)', resp.text)
+            if match:
+                return match.group(1)
+            # Look for dmsUrl or similar config
+            match = re.search(r'dmsUrl\s*[=:]\s*["\']([^"\']+)["\']', resp.text)
+            if match:
+                return match.group(1)
+            return None
+        except Exception:
+            return None
 
     def delete_rdv(self, rdv_id: str) -> dict:
         """Delete an RDV from ServiceBox agenda."""
@@ -394,10 +443,10 @@ class ServiceBoxSession:
         _log("info", f"Vehicule: {req.marque_libelle} {req.ldp_libelle}, Immat: {req.immatriculation}, VIN: {req.vin}", "creerRdv")
         _log("info", f"Travail: {req.travail_nom} ({req.travail_duree}h)", "creerRdv")
 
-        # Step 0: Search for existing client
-        existing_client = self._search_client(req.tel_mobile, req.nom)
+        # Step 0: Search for existing client in Alpha DMS
+        existing_client = self._search_client_dms(req.tel_mobile)
         if existing_client:
-            steps.append(StepResult(name="Recherche client", status="ok", detail=f"Client existant: {existing_client['nom']} (id={existing_client['id']})"))
+            steps.append(StepResult(name="Recherche client", status="ok", detail=f"Client DMS: {existing_client['prenom']} {existing_client['nom']} (dms_id={existing_client['dms_id']})"))
         else:
             steps.append(StepResult(name="Recherche client", status="ok", detail="Nouveau client"))
 
@@ -447,7 +496,7 @@ class ServiceBoxSession:
             "X-Requested-With": "XMLHttpRequest",
         }
 
-        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, client_id=existing_client["id"] if existing_client else "")
+        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, client_dms_id=existing_client["dms_id"] if existing_client else "")
         response = self.session.post(
             f"{self.base_url}/agenda/sauvegarderRdv.action",
             data=payload,
@@ -515,7 +564,7 @@ class ServiceBoxSession:
             if rdv_id:
                 _log("info", f"rdvId={rdv_id}", "sauvegarderRdv")
 
-            used_client_id = existing_client["id"] if existing_client else ""
+            used_client_id = existing_client["dms_id"] if existing_client else ""
 
             if not dossier_id:
                 steps.append(StepResult(name="Transfert Alpha", status="skipped", detail="Pas de dossierId"))
@@ -674,7 +723,7 @@ class ServiceBoxSession:
 
         return steps
 
-    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, client_id: str = "") -> list:
+    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, client_dms_id: str = "") -> list:
         duree = req.travail_duree
         return [
             ("isAppValidatedAfterDOL", ""),
@@ -715,7 +764,7 @@ class ServiceBoxSession:
             ("rdvDto.rdvMarque", req.marque),
             ("sms_Temp1", ""), ("sms_Temp2", ""), ("sms_Temp3", ""), ("sms_Temp4", ""), ("sms_Temp5", ""),
             # Client
-            ("clientDto.id", client_id),
+            ("clientDto.id", ""),
             ("clientDto.civiliteId", req.civilite_id),
             ("clientDto.nom", req.nom),
             ("clientDto.prenom", req.prenom),
@@ -734,7 +783,7 @@ class ServiceBoxSession:
             ("vehiculeDto.mec_day", req.mec_day),
             ("vehiculeDto.mec_month", req.mec_month),
             ("vehiculeDto.mec_year", req.mec_year),
-            ("clientDto.idDms", ""),
+            ("clientDto.idDms", client_dms_id),
             ("clientDto.telFixe", ""),
             ("clientDto.telMobile", req.tel_mobile),
             ("clientDto.telTravail", ""),
