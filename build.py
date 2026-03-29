@@ -9,6 +9,7 @@ def main():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
+        "--noupx",
         "--name", f"servicebox-proxy-{VERSION}",
         "--add-data", "version.py;.",
         "--hidden-import", "uvicorn.logging",
