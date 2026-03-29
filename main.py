@@ -117,6 +117,8 @@ class CreateRdvResponse(BaseModel):
     success: bool
     or_number: Optional[str] = None
     dossier_id: Optional[str] = None
+    rdv_id: Optional[str] = None
+    client_id: Optional[str] = None
     error: Optional[str] = None
     steps: list[StepResult] = []
 
@@ -254,6 +256,129 @@ class ServiceBoxSession:
 
         return {"receptionnaires": receptionnaires, "equipes": equipes}
 
+    def _search_client(self, phone: str, nom: str) -> dict | None:
+        """Search for an existing client by phone number, then by name.
+        Returns {"id": ..., "nom": ..., "prenom": ...} or None.
+        """
+        if not phone and not nom:
+            return None
+
+        ajax_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": self.base_url,
+            "Referer": f"{self.base_url}/agenda/planningReceptionnaire.action?jbnRedirect=true",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        # Try phone search first (most precise)
+        if phone:
+            clean_phone = re.sub(r"[^0-9]", "", phone)
+            _log("info", f"Recherche client par tel: {clean_phone}", "rechercheClient")
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/agenda/rechercheClient.action",
+                    data={"clientDto.telMobile": clean_phone, "isRdvCreation": "true"},
+                    headers=ajax_headers,
+                )
+                if resp.status_code == 200:
+                    results = self._parse_client_search(resp.text)
+                    if results:
+                        _log("info", f"Client trouve par tel: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
+                        return results[0]
+            except Exception as e:
+                _log("warn", f"Recherche client par tel echouee: {e}", "rechercheClient")
+
+        # Try name search as fallback
+        if nom:
+            _log("info", f"Recherche client par nom: {nom}", "rechercheClient")
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/agenda/rechercheClient.action",
+                    data={"clientDto.nom": nom, "isRdvCreation": "true"},
+                    headers=ajax_headers,
+                )
+                if resp.status_code == 200:
+                    results = self._parse_client_search(resp.text)
+                    if results:
+                        _log("info", f"Client trouve par nom: id={results[0]['id']}, {results[0]['nom']}", "rechercheClient")
+                        return results[0]
+            except Exception as e:
+                _log("warn", f"Recherche client par nom echouee: {e}", "rechercheClient")
+
+        _log("info", "Aucun client existant trouve, un nouveau sera cree", "rechercheClient")
+        return None
+
+    def _parse_client_search(self, html: str) -> list[dict]:
+        """Parse client search results from ServiceBox HTML response.
+        Returns list of {id, nom, prenom, tel_mobile} dicts.
+        """
+        clients = []
+        # ServiceBox returns a table or JSON with client results
+        # Try JSON first
+        try:
+            data = json.loads(html)
+            if isinstance(data, list):
+                for item in data:
+                    client_id = str(item.get("id", item.get("clientId", "")))
+                    if client_id:
+                        clients.append({
+                            "id": client_id,
+                            "nom": item.get("nom", ""),
+                            "prenom": item.get("prenom", ""),
+                            "tel_mobile": item.get("telMobile", ""),
+                        })
+                return clients
+            elif isinstance(data, dict) and data.get("data"):
+                items = data["data"] if isinstance(data["data"], list) else [data["data"]]
+                for item in items:
+                    client_id = str(item.get("id", item.get("clientId", "")))
+                    if client_id:
+                        clients.append({
+                            "id": client_id,
+                            "nom": item.get("nom", ""),
+                            "prenom": item.get("prenom", ""),
+                            "tel_mobile": item.get("telMobile", ""),
+                        })
+                return clients
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try HTML table parsing — look for rows with client data
+        rows = re.findall(
+            r'onclick="[^"]*selectionnerClient\((\d+)[^"]*"[^>]*>.*?<td[^>]*>(.*?)</td>.*?<td[^>]*>(.*?)</td>',
+            html, re.DOTALL,
+        )
+        for client_id, col1, col2 in rows:
+            clients.append({
+                "id": client_id,
+                "nom": re.sub(r"<[^>]+>", "", col1).strip(),
+                "prenom": re.sub(r"<[^>]+>", "", col2).strip(),
+                "tel_mobile": "",
+            })
+
+        return clients
+
+    def delete_rdv(self, rdv_id: str) -> dict:
+        """Delete an RDV from ServiceBox agenda."""
+        _log("info", f"Suppression RDV {rdv_id}...", "supprimerRdv")
+        ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        resp = self.session.get(
+            f"{self.base_url}/agenda/supprimerRdv.action",
+            params={"rdvId": rdv_id, "_": str(ts)},
+            headers={
+                "Accept": "*/*",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_url}/agenda/?tabControlID=&jbnContext=true",
+            },
+        )
+        _log("info", f"HTTP {resp.status_code} ({len(resp.text)} bytes)", "supprimerRdv")
+        if resp.status_code != 200:
+            _log("error", f"Echec HTTP {resp.status_code}", "supprimerRdv")
+            return {"success": False, "error": f"HTTP {resp.status_code}"}
+        _log("info", "RDV supprime", "supprimerRdv")
+        return {"success": True}
+
     def create_rdv(self, req: CreateRdvRequest) -> CreateRdvResponse:
         """Create RDV + transfer to Alpha DMS. Returns OR number with step tracking."""
         steps: list[StepResult] = []
@@ -264,6 +389,13 @@ class ServiceBoxSession:
         _log("info", f"Client: {req.prenom} {req.nom}, Tel: {req.tel_mobile}", "creerRdv")
         _log("info", f"Vehicule: {req.marque_libelle} {req.ldp_libelle}, Immat: {req.immatriculation}, VIN: {req.vin}", "creerRdv")
         _log("info", f"Travail: {req.travail_nom} ({req.travail_duree}h)", "creerRdv")
+
+        # Step 0: Search for existing client
+        existing_client = self._search_client(req.tel_mobile, req.nom)
+        if existing_client:
+            steps.append(StepResult(name="Recherche client", status="ok", detail=f"Client existant: {existing_client['nom']} (id={existing_client['id']})"))
+        else:
+            steps.append(StepResult(name="Recherche client", status="ok", detail="Nouveau client"))
 
         ajax_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -311,7 +443,7 @@ class ServiceBoxSession:
             "X-Requested-With": "XMLHttpRequest",
         }
 
-        payload = self._build_rdv_payload(req, reception_dt, restitution_dt)
+        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, client_id=existing_client["id"] if existing_client else "")
         response = self.session.post(
             f"{self.base_url}/agenda/sauvegarderRdv.action",
             data=payload,
@@ -370,9 +502,20 @@ class ServiceBoxSession:
                 _log("info", f"OK — dossierId={dossier_id}", "sauvegarderRdv")
                 steps.append(StepResult(name="Sauvegarde RDV", status="ok", detail=f"Dossier {dossier_id}"))
 
+            # Extract rdvId from response if available
+            rdv_id = ""
+            if retour:
+                rdv_id = str(retour.get("rdvId", retour.get("id", "")))
+            if not rdv_id:
+                rdv_id = str(result.get("data", {}).get("retour", {}).get("rdvId", ""))
+            if rdv_id:
+                _log("info", f"rdvId={rdv_id}", "sauvegarderRdv")
+
+            used_client_id = existing_client["id"] if existing_client else ""
+
             if not dossier_id:
                 steps.append(StepResult(name="Transfert Alpha", status="skipped", detail="Pas de dossierId"))
-                return CreateRdvResponse(success=True, error="RDV cree mais pas de dossierId pour le transfert Alpha", steps=steps)
+                return CreateRdvResponse(success=True, rdv_id=rdv_id or None, client_id=used_client_id or None, error="RDV cree mais pas de dossierId pour le transfert Alpha", steps=steps)
 
             # Transfer to Alpha DMS
             alpha_steps = self._transfer_to_alpha(dossier_id)
@@ -383,7 +526,7 @@ class ServiceBoxSession:
             if last and last.status == "ok" and last.name == "Reponse DMS":
                 or_number = last.detail.replace("OR n°", "").strip() if last.detail.startswith("OR") else None
 
-            return CreateRdvResponse(success=True, or_number=or_number, dossier_id=dossier_id, steps=steps)
+            return CreateRdvResponse(success=True, or_number=or_number, dossier_id=dossier_id, rdv_id=rdv_id or None, client_id=used_client_id or None, steps=steps)
 
         except (ValueError, KeyError) as e:
             _log("error", str(e), "sauvegarderRdv")
@@ -527,7 +670,7 @@ class ServiceBoxSession:
 
         return steps
 
-    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str) -> list:
+    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, client_id: str = "") -> list:
         duree = req.travail_duree
         return [
             ("isAppValidatedAfterDOL", ""),
@@ -568,7 +711,7 @@ class ServiceBoxSession:
             ("rdvDto.rdvMarque", req.marque),
             ("sms_Temp1", ""), ("sms_Temp2", ""), ("sms_Temp3", ""), ("sms_Temp4", ""), ("sms_Temp5", ""),
             # Client
-            ("clientDto.id", ""),
+            ("clientDto.id", client_id),
             ("clientDto.civiliteId", req.civilite_id),
             ("clientDto.nom", req.nom),
             ("clientDto.prenom", req.prenom),
@@ -922,6 +1065,20 @@ def create_rdv(req: CreateRdvRequest):
     except Exception as e:
         traceback.print_exc()
         return CreateRdvResponse(success=False, error=str(e))
+
+
+class DeleteRdvRequest(Credentials):
+    rdv_id: str
+
+
+@app.post("/delete-rdv")
+def delete_rdv(req: DeleteRdvRequest):
+    try:
+        session = _get_session(req)
+        return session.delete_rdv(req.rdv_id)
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/reset-session")
