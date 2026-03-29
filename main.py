@@ -276,7 +276,7 @@ class ServiceBoxSession:
             _log("info", f"RelaisServlet: {relais_url}", "rechercheClient")
 
             if clean_phone and len(clean_phone) >= 6:
-                result = self._dms_search(relais_url, code_interrogation="1", search_value=clean_phone)
+                result = self._dms_search(relais_url, code_interrogation="6", search_value=clean_phone)
                 if result:
                     return result
 
@@ -301,7 +301,7 @@ class ServiceBoxSession:
             )
 
             from urllib.parse import quote as url_quote
-            encoded_xml = url_quote(url_quote(dms_xml, safe=""))
+            encoded_xml = url_quote(dms_xml, safe="")
 
             relais_headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
