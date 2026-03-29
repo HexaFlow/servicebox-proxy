@@ -256,36 +256,60 @@ class ServiceBoxSession:
 
         return {"receptionnaires": receptionnaires, "equipes": equipes}
 
-    def _search_client_dms(self, phone: str) -> dict | None:
-        """Search for an existing client via Alpha DMS RelaisServlet by phone number.
+    def _search_client_dms(self, phone: str, nom: str = "") -> dict | None:
+        """Search for an existing client via Alpha DMS RelaisServlet.
+        Tries phone search first, then falls back to name search.
         Returns {"dms_id": ..., "nom": ..., "prenom": ...} or None.
-        Uses the same DMS relay flow as the browser:
-        1. POST to RelaisServlet with phone search XML (CODE_INTERROGATION=6)
-        2. Parse CLIENT elements from the DMS response
-        3. POST to dmsClientVehiculeSelection.action to select the client in the SB session
         """
-        if not phone:
+        if not phone and not nom:
             return None
 
-        clean_phone = re.sub(r"[^0-9]", "", phone)
-        if len(clean_phone) < 6:
-            return None
+        clean_phone = re.sub(r"[^0-9]", "", phone) if phone else ""
 
         _log("info", f"Recherche client DMS par tel: {clean_phone}", "rechercheClient")
 
         try:
-            # Step 1: We need the RelaisServlet URL and PARAMDMS.
-            # Get them from the dmsPutDossier form (same as transfer flow).
-            # But since we haven't created a dossier yet, we need the DMS relay URL
-            # from the agenda page. Use a simpler approach: call the same RelaisServlet
-            # that the browser uses.
+            relais_url = self._get_relais_url()
+            if not relais_url:
+                _log("warn", "Impossible de trouver l'URL RelaisServlet", "rechercheClient")
+                return None
+            _log("info", f"RelaisServlet: {relais_url}", "rechercheClient")
 
-            # Build the DMS search XML — CODE_INTERROGATION=6 is phone search
-            # Truncate to 8 digits (ServiceBox behavior)
-            search_phone = clean_phone[:8] if len(clean_phone) > 8 else clean_phone
+            # Try phone search with different formats
+            if clean_phone and len(clean_phone) >= 6:
+                # Try full phone number first (10 digits)
+                result = self._dms_search(relais_url, code_interrogation="6", search_value=clean_phone)
+                if result:
+                    return result
+
+                # Try without leading 0 (e.g. 651022462)
+                if clean_phone.startswith("0") and len(clean_phone) >= 10:
+                    result = self._dms_search(relais_url, code_interrogation="6", search_value=clean_phone[1:])
+                    if result:
+                        return result
+
+            # Fallback: search by name (CODE_INTERROGATION=1)
+            if nom:
+                _log("info", f"Recherche client par nom: {nom}", "rechercheClient")
+                result = self._dms_search(relais_url, code_interrogation="1", search_value=nom.upper())
+                if result:
+                    return result
+
+            _log("info", "Aucun client existant trouve, un nouveau sera cree", "rechercheClient")
+            return None
+
+        except Exception as e:
+            _log("warn", f"Recherche client DMS echouee: {e}", "rechercheClient")
+            return None
+
+    def _dms_search(self, relais_url: str, code_interrogation: str, search_value: str) -> dict | None:
+        """Execute a single DMS search via RelaisServlet. Returns client dict or None."""
+        _log("info", f"DMS search: code={code_interrogation}, value={search_value}", "rechercheClient")
+
+        try:
             dms_xml = (
-                f'<DMS TYPE = "01" CODE_INTERROGATION = "6" '
-                f'CHAMPS_CMPL = "{search_phone}" '
+                f'<DMS TYPE = "01" CODE_INTERROGATION = "{code_interrogation}" '
+                f'CHAMPS_CMPL = "{search_value}" '
                 f'NumeroPoste = "@P@" '
                 f'PARAMDMS = "R:CIT" '
                 f'></DMS>'
@@ -293,15 +317,6 @@ class ServiceBoxSession:
 
             from urllib.parse import quote as url_quote
             encoded_xml = url_quote(url_quote(dms_xml, safe=""))
-
-            # We need the RelaisServlet URL — it's site-specific.
-            # Extract it from the agenda page by looking for the DMS config.
-            relais_url = self._get_relais_url()
-            if not relais_url:
-                _log("warn", "Impossible de trouver l'URL RelaisServlet", "rechercheClient")
-                return None
-
-            _log("info", f"RelaisServlet: {relais_url}", "rechercheClient")
 
             relais_headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -328,8 +343,7 @@ class ServiceBoxSession:
             dms_response_html = relais_resp.text
             _log("info", f"Reponse DMS ({len(dms_response_html)} bytes)", "rechercheClient")
 
-            # Step 2: Parse CLIENT elements from the DMS XML response
-            # The response is an HTML form containing URL-encoded XML in a hidden field
+            # Parse CLIENT elements from the DMS XML response
             xml_match = re.search(r'name="xml"\s+value="([^"]*)"', dms_response_html)
             if not xml_match:
                 _log("info", "Pas de champ xml dans la reponse DMS", "rechercheClient")
@@ -337,7 +351,7 @@ class ServiceBoxSession:
 
             from urllib.parse import unquote
             xml_data = unquote(xml_match.group(1))
-            _log("info", f"XML DMS: {xml_data[:300]}", "rechercheClient")
+            _log("info", f"XML DMS: {xml_data[:500]}", "rechercheClient")
 
             # Parse CLIENT elements
             clients = re.findall(
@@ -345,14 +359,14 @@ class ServiceBoxSession:
                 xml_data,
             )
             if not clients:
-                _log("info", "Aucun CLIENT dans la reponse DMS", "rechercheClient")
+                _log("info", f"Aucun CLIENT dans la reponse DMS (code={code_interrogation}, value={search_value})", "rechercheClient")
                 return None
 
             # Parse first client's attributes
             first_client_attrs = clients[0]
             dms_id = re.search(r'CLIENT_DMS_ID\s*=\s*"([^"]*)"', first_client_attrs)
-            nom = re.search(r'Nom\s*=\s*"([^"]*)"', first_client_attrs)
-            prenom = re.search(r'Prenom\s*=\s*"([^"]*)"', first_client_attrs)
+            nom_match = re.search(r'Nom\s*=\s*"([^"]*)"', first_client_attrs)
+            prenom_match = re.search(r'Prenom\s*=\s*"([^"]*)"', first_client_attrs)
 
             if not dms_id:
                 _log("warn", "CLIENT_DMS_ID introuvable", "rechercheClient")
@@ -360,12 +374,12 @@ class ServiceBoxSession:
 
             client = {
                 "dms_id": dms_id.group(1),
-                "nom": nom.group(1) if nom else "",
-                "prenom": prenom.group(1) if prenom else "",
+                "nom": nom_match.group(1) if nom_match else "",
+                "prenom": prenom_match.group(1) if prenom_match else "",
             }
             _log("info", f"Client DMS trouve: id={client['dms_id']}, {client['prenom']} {client['nom']} ({len(clients)} resultats)", "rechercheClient")
 
-            # Step 3: Select this client in ServiceBox session
+            # Select this client in ServiceBox session
             _log("info", "Selection du client dans ServiceBox...", "rechercheClient")
             select_resp = self.session.post(
                 f"{self.base_url}/agenda/dmsClientVehiculeSelection.action",
@@ -386,7 +400,7 @@ class ServiceBoxSession:
             return client
 
         except Exception as e:
-            _log("warn", f"Recherche client DMS echouee: {e}", "rechercheClient")
+            _log("warn", f"DMS search error: {e}", "rechercheClient")
             return None
 
     def _get_relais_url(self) -> str | None:
@@ -444,7 +458,7 @@ class ServiceBoxSession:
         _log("info", f"Travail: {req.travail_nom} ({req.travail_duree}h)", "creerRdv")
 
         # Step 0: Search for existing client in Alpha DMS
-        existing_client = self._search_client_dms(req.tel_mobile)
+        existing_client = self._search_client_dms(req.tel_mobile, nom=req.nom)
         if existing_client:
             steps.append(StepResult(name="Recherche client", status="ok", detail=f"Client DMS: {existing_client['prenom']} {existing_client['nom']} (dms_id={existing_client['dms_id']})"))
         else:
