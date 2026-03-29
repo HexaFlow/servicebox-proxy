@@ -21,7 +21,7 @@ import requests
 from version import VERSION
 
 GITHUB_REPO = "HexaFlow/servicebox-proxy"
-CHECK_INTERVAL_MINUTES = 30  # 30 min to avoid GitHub rate limits (60 req/hr unauth)
+CHECK_INTERVAL_MINUTES = 1
 
 
 def _is_frozen() -> bool:
