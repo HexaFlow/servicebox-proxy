@@ -23,6 +23,7 @@ from version import VERSION
 
 GITHUB_REPO = "HexaFlow/servicebox-proxy"
 CHECK_INTERVAL_MINUTES = 15
+SERVICE_NAME = "ServiceBoxProxy"
 
 
 def _is_frozen() -> bool:
@@ -33,6 +34,25 @@ def _is_frozen() -> bool:
 def _exe_path() -> Path:
     """Path to the current executable (only meaningful when frozen)."""
     return Path(sys.executable)
+
+
+def _is_running_as_service() -> bool:
+    """Check if this process is running as a Windows Service (via NSSM)."""
+    try:
+        result = subprocess.run(
+            ["sc", "query", SERVICE_NAME],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "RUNNING" in result.stdout:
+            qc = subprocess.run(
+                ["sc", "qc", SERVICE_NAME],
+                capture_output=True, text=True, timeout=5,
+            )
+            if str(_exe_path()).lower() in qc.stdout.lower() or "nssm" in qc.stdout.lower():
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _log_file_path() -> Path:
@@ -186,16 +206,60 @@ def apply_update(release: dict) -> bool:
     except Exception:
         pass
 
+    # Detect if running as a Windows Service (via NSSM)
+    is_service = _is_running_as_service()
+
     # Write a .bat that swaps the exe and relaunches
     # Key: redirect new exe's stderr to log file to capture crash errors
     bat_path = current_exe.with_name("_update.bat")
-    bat_content = f"""@echo off
+
+    if is_service:
+        # Service mode: stop service, swap exe, restart service
+        bat_content = f"""@echo off
+echo [bat] Demarrage de la mise a jour (mode service)... >> "{log_file}"
+echo [bat] Date: %date% %time% >> "{log_file}"
+echo [bat] Arret du service ServiceBoxProxy... >> "{log_file}"
+net stop ServiceBoxProxy >> "{log_file}" 2>&1
+timeout /t 3 /nobreak >nul
+
+set retries=0
+:retry_delete
+del "{current_exe}" 2>nul
+if exist "{current_exe}" (
+    set /a retries+=1
+    echo [bat] Tentative %retries%/15 de suppression... >> "{log_file}"
+    if %retries% GEQ 15 (
+        echo [bat] ERREUR: impossible de supprimer l'ancien exe >> "{log_file}"
+        echo [bat] Redemarrage du service avec ancienne version... >> "{log_file}"
+        net start ServiceBoxProxy >> "{log_file}" 2>&1
+        exit /b 1
+    )
+    timeout /t 2 /nobreak >nul
+    goto retry_delete
+)
+
+echo [bat] Ancien exe supprime. >> "{log_file}"
+powershell -Command "Unblock-File -Path '{update_exe}'" >nul 2>&1
+move "{update_exe}" "{current_exe}" >> "{log_file}" 2>&1
+if errorlevel 1 (
+    echo [bat] ERREUR: impossible de renommer le fichier >> "{log_file}"
+    exit /b 1
+)
+powershell -Command "Unblock-File -Path '{current_exe}'" >nul 2>&1
+echo [bat] Fichier renomme OK. Demarrage du service... >> "{log_file}"
+net start ServiceBoxProxy >> "{log_file}" 2>&1
+echo [bat] Service demarre avec code: %errorlevel% >> "{log_file}"
+timeout /t 3 /nobreak >nul
+del "%~f0"
+"""
+    else:
+        # Standalone mode: swap exe, relaunch via explorer
+        bat_content = f"""@echo off
 echo [bat] Demarrage de la mise a jour... >> "{log_file}"
 echo [bat] Date: %date% %time% >> "{log_file}"
 echo [bat] Attente de la fermeture du processus... >> "{log_file}"
 timeout /t 3 /nobreak >nul
 
-REM Retry deleting the old exe up to 15 times
 set retries=0
 :retry_delete
 del "{current_exe}" 2>nul
@@ -211,23 +275,14 @@ if exist "{current_exe}" (
 )
 
 echo [bat] Ancien exe supprime. >> "{log_file}"
-
-REM Unblock the update exe before renaming
 powershell -Command "Unblock-File -Path '{update_exe}'" >nul 2>&1
-
 move "{update_exe}" "{current_exe}" >> "{log_file}" 2>&1
 if errorlevel 1 (
     echo [bat] ERREUR: impossible de renommer le fichier >> "{log_file}"
     exit /b 1
 )
-
-REM Unblock the renamed exe too
 powershell -Command "Unblock-File -Path '{current_exe}'" >nul 2>&1
-
 echo [bat] Fichier renomme OK. Lancement... >> "{log_file}"
-
-REM Launch the new exe via explorer.exe (same as double-clicking)
-echo [bat] Lancement via explorer.exe... >> "{log_file}"
 explorer.exe "{current_exe}"
 echo [bat] explorer.exe lance avec code: %errorlevel% >> "{log_file}"
 timeout /t 3 /nobreak >nul
@@ -237,9 +292,19 @@ del "%~f0"
         f.write(bat_content)
 
     _log(f"Lancement de la mise a jour -> {release['tag_name']}")
-    # Launch bat in a VISIBLE window so user sees output
-    subprocess.Popen(["cmd", "/c", str(bat_path)])
-    return True
+    if is_service:
+        # Launch bat fully detached so NSSM can't kill it when stopping the service
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS = 0x00000008
+        subprocess.Popen(
+            ["cmd", "/c", str(bat_path)],
+            creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+            close_fds=True,
+        )
+    else:
+        subprocess.Popen(["cmd", "/c", str(bat_path)])
+    # "service" = bat will net stop us, "standalone" = caller should os._exit
+    return "service" if is_service else "standalone"
 
 
 def _background_check_loop():
@@ -249,9 +314,15 @@ def _background_check_loop():
         _log(f"Verification des mises a jour... (v{VERSION})")
         release = check_for_update()
         if release:
-            if apply_update(release):
+            result = apply_update(release)
+            if result == "service":
+                # Service mode: the .bat will `net stop` us — just wait
+                _log("Mise a jour lancee, le .bat va arreter le service...")
+                time.sleep(120)  # Wait for .bat to stop us via net stop
+            elif result == "standalone":
+                # Standalone mode: we need to exit so .bat can swap the exe
                 _log("Mise a jour lancee, arret du processus...")
-                os._exit(0)  # Force exit — the .bat script will restart us
+                os._exit(0)
 
 
 def start_update_checker():
@@ -259,7 +330,8 @@ def start_update_checker():
     _log(f"Version actuelle: {VERSION}")
     release = check_for_update()
     if release:
-        if apply_update(release):
+        result = apply_update(release)
+        if result in ("service", "standalone"):
             return True
     _log(f"Verification periodique activee (toutes les {CHECK_INTERVAL_MINUTES} min)")
     t = threading.Thread(target=_background_check_loop, daemon=True)
