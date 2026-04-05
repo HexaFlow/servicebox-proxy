@@ -43,7 +43,7 @@ app.add_middleware(
 
 # ─── In-memory log ring buffer ────────────────────────────────────────────
 
-_log_entries: deque = deque(maxlen=200)
+_log_entries: deque = deque(maxlen=2000)
 
 
 def _log(level: str, message: str, step: str = ""):
@@ -1042,7 +1042,7 @@ async function testFetch() {
 
 
 @app.get("/logs")
-def get_logs(limit: int = 50):
+def get_logs(limit: int = 200):
     """Return the last N log entries (newest first)."""
     entries = list(_log_entries)[-limit:]
     entries.reverse()
