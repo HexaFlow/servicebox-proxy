@@ -31,6 +31,8 @@ from version import VERSION
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+BACKEND_URL = "https://api-727559206231.europe-west9.run.app"
+
 app = FastAPI(title="ServiceBox Proxy", version=VERSION)
 
 app.add_middleware(
@@ -214,6 +216,78 @@ class ServiceBoxSession:
                     break
 
         _log("info", f"Auth method final: {self.auth_method}", "bootstrap")
+
+        # After bootstrap, exchange SSO token and sync to backend
+        self._sync_sso_token()
+
+    def _sync_sso_token(self):
+        """Get SSO token from multibrand API and push it to the backend."""
+        try:
+            _log("info", "Echange SSO token...", "ssoSync")
+            cmm_resp = self.session.get(f"{self.base_url}/docapvpr/$cmm/", timeout=15)
+            if cmm_resp.status_code != 200:
+                _log("warn", f"$cmm returned {cmm_resp.status_code}", "ssoSync")
+                return
+
+            match = re.search(
+                r"var appUrl = '(https://multibrand\.servicebox-parts\.com[^']+)'",
+                cmm_resp.text,
+            )
+            if not match:
+                _log("warn", "Pas de appUrl dans la reponse $cmm", "ssoSync")
+                return
+
+            from urllib.parse import urlparse
+            app_url = match.group(1)
+            parsed = urlparse(app_url)
+            sso_param = parsed.query
+
+            login_resp = requests.get(
+                "https://multibrand.servicebox-parts.com/bo/common/v1/api/login",
+                params={"p": sso_param},
+                timeout=15,
+            )
+            if login_resp.status_code != 200:
+                _log("warn", f"Multibrand login returned {login_resp.status_code}", "ssoSync")
+                return
+
+            data = login_resp.json()
+            sso_token = data.get("token")
+            if not sso_token:
+                _log("warn", "Pas de token dans la reponse login", "ssoSync")
+                return
+
+            # Decode JWT to get user_id
+            import base64 as b64
+            payload_b64 = sso_token.split(".")[1]
+            payload_b64 = payload_b64.replace("-", "+").replace("_", "/")
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            payload = json.loads(b64.b64decode(payload_b64).decode())
+            user_id = payload.get("sub", "")
+
+            _log("info", f"SSO token obtenu (user_id={user_id})", "ssoSync")
+
+            # Push to backend
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/public/servicebox/sync-token",
+                    json={
+                        "username": self.user,
+                        "password": self.password,
+                        "sso_token": sso_token,
+                        "user_id": user_id,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    _log("info", "SSO token synchronise avec le backend", "ssoSync")
+                else:
+                    _log("warn", f"Backend sync returned {resp.status_code}: {resp.text[:200]}", "ssoSync")
+            except Exception as e:
+                _log("warn", f"Backend sync echoue: {e}", "ssoSync")
+
+        except Exception as e:
+            _log("warn", f"SSO token exchange echoue: {e}", "ssoSync")
 
     def get_agenda_options(self) -> dict:
         url = f"{self.base_url}/agenda/creerRdv.action"
@@ -1059,6 +1133,28 @@ def _session_keepalive_loop():
 _session_keepalive_thread = threading.Thread(target=_session_keepalive_loop, daemon=True)
 _session_keepalive_thread.start()
 _log("info", f"Session keep-alive started (every {SESSION_KEEPALIVE_INTERVAL}s)", "keepalive")
+
+
+# ─── Periodic SSO token sync ────────────────────────────────────────────
+
+SSO_SYNC_INTERVAL = 20 * 60  # 20 minutes
+
+
+def _sso_sync_loop():
+    """Re-sync SSO tokens for all active sessions every 20 minutes."""
+    while True:
+        time.sleep(SSO_SYNC_INTERVAL)
+        for username, session in list(_sessions.items()):
+            try:
+                _log("info", f"Re-sync SSO token pour {username}...", "ssoSync")
+                session._sync_sso_token()
+            except Exception as e:
+                _log("warn", f"SSO re-sync echoue pour {username}: {e}", "ssoSync")
+
+
+_sso_sync_thread = threading.Thread(target=_sso_sync_loop, daemon=True)
+_sso_sync_thread.start()
+_log("info", f"SSO sync started (every {SSO_SYNC_INTERVAL // 60}min)", "ssoSync")
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────
