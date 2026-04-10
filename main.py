@@ -736,7 +736,7 @@ class ServiceBoxSession:
 
     def fetch_estimation(self, dossier_id: str) -> "FetchEstimationResponse":
         """Navigate to basket then fetch the estimation HTML."""
-        _log("info", f"Debut fetch_estimation — dossier_id={dossier_id}, session user={self.username}", "fetchEstimation")
+        _log("info", f"Debut fetch_estimation — dossier_id={dossier_id}, session user={self.user}", "fetchEstimation")
 
         # Step 1: Set basket to the given dossier
         _log("info", f"Panier -> dossier {dossier_id}...", "fetchEstimation")
