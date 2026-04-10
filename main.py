@@ -1068,6 +1068,23 @@ def health():
     return {"status": "ok", "version": VERSION, "sessions": len(_sessions)}
 
 
+@app.post("/force-update")
+def force_update():
+    """Trigger an immediate update check. If a newer version exists, download and restart."""
+    from updater import check_for_update, apply_update
+    release = check_for_update()
+    if not release:
+        return {"updated": False, "message": f"Deja a jour (v{VERSION})"}
+    result = apply_update(release)
+    if result == "service":
+        return {"updated": True, "message": f"Mise a jour vers {release['tag_name']} lancee (redemarrage service)"}
+    elif result == "standalone":
+        import os
+        threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
+        return {"updated": True, "message": f"Mise a jour vers {release['tag_name']} lancee (redemarrage)"}
+    return {"updated": False, "message": f"Version {release['tag_name']} disponible mais non applicable (mode dev)"}
+
+
 @app.get("/verify-browser")
 def verify_browser():
     """HTML page to verify ServiceBox credentials in the browser on this machine."""
