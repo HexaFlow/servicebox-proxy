@@ -68,8 +68,10 @@ def _parse_version(tag: str) -> tuple:
 
 
 def _log(msg: str):
-    """Print with [updater] prefix, flush, and also append to log file."""
-    line = f"[updater] {msg}"
+    """Print with [updater] prefix + timestamp, flush, and also append to log file."""
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"{ts} [updater] {msg}"
     print(line, flush=True)
     try:
         with open(_log_file_path(), "a", encoding="utf-8") as f:
