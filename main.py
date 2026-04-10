@@ -101,7 +101,9 @@ class CreateRdvRequest(Credentials):
     mec_day: str = ""
     mec_month: str = ""
     mec_year: str = ""
-    # Intervention
+    # Intervention (array of work items)
+    travaux: list[dict] = []  # [{"nom": "...", "duree": "0.50"}, ...]
+    # Legacy single-intervention fields (used as fallback if travaux is empty)
     travail_nom: str = ""
     travail_duree: str = "0.50"
     # Config
@@ -525,7 +527,11 @@ class ServiceBoxSession:
         _log("info", f"Receptionnaire: {req.receptionnaire_id}, Equipe: {req.equipe_id}", "creerRdv")
         _log("info", f"Client: {req.prenom} {req.nom}, Tel: {req.tel_mobile}", "creerRdv")
         _log("info", f"Vehicule: {req.marque_libelle} {req.ldp_libelle}, Immat: {req.immatriculation}, VIN: {req.vin}", "creerRdv")
-        _log("info", f"Travail: {req.travail_nom} ({req.travail_duree}h)", "creerRdv")
+        # Resolve interventions: use travaux array if provided, else fall back to legacy fields
+        travaux = req.travaux if req.travaux else [{"nom": req.travail_nom or "Intervention", "duree": req.travail_duree}]
+        total_duree = f"{sum(float(t.get('duree', 0.5)) for t in travaux):.2f}"
+        for t in travaux:
+            _log("info", f"Travail: {t['nom']} ({t.get('duree', '0.50')}h)", "creerRdv")
 
         # Step 0: Search for existing client in Alpha DMS
         existing_client = self._search_client_dms(req.tel_mobile, nom=req.nom)
@@ -570,7 +576,7 @@ class ServiceBoxSession:
         reception_dt = f"{req.date}{req.heure}"
         restitution_dt = f"{req.date}{req.restitution_heure}"
 
-        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}, duree={req.travail_duree}h", "sauvegarderRdv")
+        _log("info", f"Sauvegarde du RDV... reception={reception_dt}, restitution={restitution_dt}, duree={total_duree}h ({len(travaux)} travaux)", "sauvegarderRdv")
 
         save_headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -580,7 +586,7 @@ class ServiceBoxSession:
             "X-Requested-With": "XMLHttpRequest",
         }
 
-        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, client_dms_id=existing_client["dms_id"] if existing_client else "")
+        payload = self._build_rdv_payload(req, reception_dt, restitution_dt, travaux=travaux, total_duree=total_duree, client_dms_id=existing_client["dms_id"] if existing_client else "")
         response = self.session.post(
             f"{self.base_url}/agenda/sauvegarderRdv.action",
             data=payload,
@@ -867,9 +873,11 @@ class ServiceBoxSession:
 
         return FetchEstimationResponse(success=True, html=html)
 
-    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, client_dms_id: str = "") -> list:
-        duree = req.travail_duree
-        return [
+    def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, travaux: list[dict] = None, total_duree: str = "0.50", client_dms_id: str = "") -> list:
+        if not travaux:
+            travaux = [{"nom": req.travail_nom or "Intervention", "duree": req.travail_duree}]
+            total_duree = req.travail_duree
+        payload = [
             ("isAppValidatedAfterDOL", ""),
             ("roleRestituteEnable", "true"),
             ("rdvDto.id", ""),
@@ -945,25 +953,36 @@ class ServiceBoxSession:
             ("vehiculeDto.idDms", ""), ("vehiculeDto.ldpCode", ""),
             ("vehiculeDto.dateMiseCirculation", "00"),
             ("isDistributedAgain", "true"), ("isDistributedAgain2", "true"),
-            # Work
-            ("rdvTravailDtoList[0].id", ""),
-            ("rdvTravailDtoList[0].travailId", ""),
-            ("rdvTravailDtoList[0].numLdt", "_0"),
-            ("rdvTravailDtoList[0].statut", ""),
-            ("rdvTravailDtoList[0].idExterne", ""),
-            ("rdvTravailDtoList[0].type", ""),
-            ("rdvTravailDtoList[0].codeSagai", ""),
-            ("rdvTravailDtoList[0].categorie", ""),
-            ("rdvTravailDtoList[0].dureeReference", ""),
-            ("rdvTravailDtoList[0].ldtDateModificationTimestamp", ""),
-            ("rdvTravailDtoList[0].initial", "true"),
-            ("rdvTravailDtoList[0].nom", req.travail_nom),
-            ("rdvTravailDtoList[0].duree", duree),
-            ("rdvTravailDtoList[0].equipeId", req.equipe_id),
-            ("rdvTravailDtoList[1].type", "mecanique"),
+            # Work — dynamically generated below
+        ]
+        # Generate one rdvTravailDtoList entry per intervention
+        for i, t in enumerate(travaux):
+            prefix = f"rdvTravailDtoList[{i}]"
+            payload.extend([
+                (f"{prefix}.id", ""),
+                (f"{prefix}.travailId", ""),
+                (f"{prefix}.numLdt", f"_{i}"),
+                (f"{prefix}.statut", ""),
+                (f"{prefix}.idExterne", ""),
+                (f"{prefix}.type", ""),
+                (f"{prefix}.codeSagai", ""),
+                (f"{prefix}.categorie", ""),
+                (f"{prefix}.dureeReference", ""),
+                (f"{prefix}.ldtDateModificationTimestamp", ""),
+                (f"{prefix}.initial", "true"),
+                (f"{prefix}.nom", t.get("nom", "Intervention")),
+                (f"{prefix}.duree", t.get("duree", "0.50")),
+                (f"{prefix}.equipeId", req.equipe_id),
+            ])
+        # Sentinel entry after last work item
+        payload.append((f"rdvTravailDtoList[{len(travaux)}].type", "mecanique"))
+        # Intervention summary
+        payload.extend([
             ("rdvInterventionDtoList[0].equipeId", req.equipe_id),
             ("rdvInterventionDtoList[0].statut", ""),
-            ("rdvInterventionDtoList[0].dureeEstimee", duree),
+            ("rdvInterventionDtoList[0].dureeEstimee", total_duree),
+        ])
+        payload.extend([
             # RDV flags
             ("rdvDto.entretienRapide", ""), ("rdvDto.mecaniqueLourde", ""),
             ("rdvDto.diagnostic", ""), ("rdvDto.carrosserie", ""),
@@ -1029,7 +1048,8 @@ class ServiceBoxSession:
             ("compteur", "0"),
             ("maxLengthSMS", "160"),
             ("saisieSmsDto.messageDateProgramme", ""),
-        ]
+        ])
+        return payload
 
 
 # ─── HTML Parsing helpers ────────────────────────────────────────────────
