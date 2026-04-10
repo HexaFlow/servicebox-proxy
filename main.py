@@ -128,6 +128,16 @@ class AgendaOptionsResponse(BaseModel):
     equipes: list[dict]          # [{id, name}]
 
 
+class FetchEstimationRequest(Credentials):
+    dossier_id: str
+
+
+class FetchEstimationResponse(BaseModel):
+    success: bool
+    html: Optional[str] = None
+    error: Optional[str] = None
+
+
 class TestConnectionResponse(BaseModel):
     connected: bool
     session_ok: bool
@@ -702,9 +712,10 @@ class ServiceBoxSession:
             "X-Requested-With": "XMLHttpRequest",
         }
 
+        from urllib.parse import urlencode
         resp = self.session.post(
             f"{self.base_url}/panier/dmsResponse.do",
-            data=dms_payload,
+            data=urlencode(dms_payload).encode("utf-8"),
             headers=dms_headers,
         )
         if resp.status_code != 200:
@@ -722,6 +733,65 @@ class ServiceBoxSession:
             steps.append(StepResult(name="Reponse DMS", status="ok", detail="Pas de numero OR"))
 
         return steps
+
+    def fetch_estimation(self, dossier_id: str) -> "FetchEstimationResponse":
+        """Navigate to basket then fetch the estimation HTML."""
+        _log("info", f"Debut fetch_estimation — dossier_id={dossier_id}, session user={self.username}", "fetchEstimation")
+
+        # Step 1: Set basket to the given dossier
+        _log("info", f"Panier → dossier {dossier_id}...", "fetchEstimation")
+        set_url = f"{self.base_url}/panier/panierSetCurrent.do?id={dossier_id}"
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": f"{self.base_url}/agenda/?tabControlID=&jbnContext=true",
+        }
+        try:
+            resp = self.session.get(set_url, headers=headers)
+        except Exception as e:
+            _log("error", f"Exception panierSetCurrent: {e}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"panierSetCurrent exception: {e}")
+
+        _log("info", f"panierSetCurrent status={resp.status_code}, url_finale={resp.url}, taille={len(resp.text)}", "fetchEstimation")
+        if resp.status_code != 200:
+            _log("error", f"Echec panierSetCurrent HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"panierSetCurrent HTTP {resp.status_code}")
+
+        # Check if we got redirected to login (session expired)
+        if "/login" in str(resp.url).lower() or "authentification" in resp.text[:1000].lower():
+            _log("error", "Session expiree — redirection vers login detectee", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error="Session ServiceBox expiree. Reessayez (la session sera recree).")
+
+        _log("info", "panierSetCurrent OK", "fetchEstimation")
+
+        # Step 2: Fetch estimation HTML
+        _log("info", "Requete printEstim.do...", "fetchEstimation")
+        estim_url = f"{self.base_url}/panier/printEstim.do"
+        estim_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": self.base_url,
+            "Referer": set_url,
+            "Accept": "text/html, */*; q=0.01",
+        }
+        estim_body = "ldtIdSelected=0&typePrint=HTML&afficherRefPr=true&idAfficherRefPr=true"
+        try:
+            resp = self.session.post(estim_url, data=estim_body, headers=estim_headers)
+        except Exception as e:
+            _log("error", f"Exception printEstim: {e}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"printEstim exception: {e}")
+
+        _log("info", f"printEstim status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
+        if resp.status_code != 200:
+            _log("error", f"Echec printEstim HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"printEstim HTTP {resp.status_code}")
+
+        # Validate we got actual estimation HTML (not an error page)
+        html = resp.text
+        if "Estimation" not in html and "printEstim" not in html and "DESIGNATION" not in html.upper():
+            _log("warn", f"Le HTML retourne ne ressemble pas a une estimation — premiers 500 chars: {html[:500]}", "fetchEstimation")
+
+        _log("info", f"printEstim OK — {len(html)} bytes, contient 'Estimation': {'Estimation' in html}, contient 'Sous Total': {'Sous Total' in html}", "fetchEstimation")
+
+        return FetchEstimationResponse(success=True, html=html)
 
     def _build_rdv_payload(self, req: CreateRdvRequest, reception_dt: str, restitution_dt: str, client_dms_id: str = "") -> list:
         duree = req.travail_duree
@@ -816,6 +886,7 @@ class ServiceBoxSession:
             ("rdvTravailDtoList[0].nom", req.travail_nom),
             ("rdvTravailDtoList[0].duree", duree),
             ("rdvTravailDtoList[0].equipeId", req.equipe_id),
+            ("rdvTravailDtoList[1].type", "mecanique"),
             ("rdvInterventionDtoList[0].equipeId", req.equipe_id),
             ("rdvInterventionDtoList[0].statut", ""),
             ("rdvInterventionDtoList[0].dureeEstimee", duree),
@@ -1474,6 +1545,17 @@ def debug_auth(creds: Credentials):
         results.append({"test": "Python TLS", "result": "error", "detail": str(e)})
 
     return {"results": results}
+
+
+@app.post("/fetch-estimation", response_model=FetchEstimationResponse)
+def fetch_estimation(req: FetchEstimationRequest):
+    try:
+        session = _get_session(req)
+        result = session.fetch_estimation(req.dossier_id)
+        return result
+    except Exception as e:
+        _log("error", str(e), "fetchEstimation")
+        return FetchEstimationResponse(success=False, error=str(e))
 
 
 if __name__ == "__main__":
