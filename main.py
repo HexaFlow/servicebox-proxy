@@ -1090,6 +1090,29 @@ def _parse_form_action(html: str, form_name: str = None, form_id: str = None) ->
     return parser.action
 
 
+# ─── Credential persistence (auto-bootstrap on restart) ──────────────────
+
+_CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0] if not getattr(sys, "frozen", False) else sys.executable)), "_saved_creds.json")
+
+
+def _save_creds(username: str, password: str):
+    """Persist credentials so the proxy can auto-bootstrap after restart."""
+    try:
+        with open(_CREDS_FILE, "w") as f:
+            json.dump({"username": username, "password": password}, f)
+    except Exception as e:
+        _log("warn", f"Impossible de sauvegarder les credentials: {e}", "creds")
+
+
+def _load_creds() -> dict | None:
+    """Load saved credentials, or None."""
+    try:
+        with open(_CREDS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 # ─── Helper to get or create session ─────────────────────────────────────
 
 def _get_session(creds: Credentials) -> ServiceBoxSession:
@@ -1098,6 +1121,7 @@ def _get_session(creds: Credentials) -> ServiceBoxSession:
         s = ServiceBoxSession(creds.username, creds.password)
         s.bootstrap()
         _sessions[key] = s
+        _save_creds(creds.username, creds.password)
     return _sessions[key]
 
 
@@ -1140,10 +1164,32 @@ _log("info", f"Session keep-alive started (every {SESSION_KEEPALIVE_INTERVAL}s)"
 SSO_SYNC_INTERVAL = 20 * 60  # 20 minutes
 
 
+def _ensure_session_exists():
+    """If no sessions exist, try to bootstrap from saved credentials."""
+    if _sessions:
+        return
+    saved = _load_creds()
+    if not saved:
+        return
+    username, password = saved["username"], saved["password"]
+    _log("info", f"Auto-bootstrap avec credentials sauvegardees ({username})...", "ssoSync")
+    try:
+        s = ServiceBoxSession(username, password)
+        s.bootstrap()
+        _sessions[username] = s
+    except Exception as e:
+        _log("warn", f"Auto-bootstrap echoue: {e}", "ssoSync")
+
+
 def _sso_sync_loop():
-    """Re-sync SSO tokens for all active sessions every 20 minutes."""
+    """Re-sync SSO tokens every 20 minutes. Auto-bootstraps if needed."""
+    # Initial sync on startup (after short delay for proxy to be ready)
+    time.sleep(10)
+    _ensure_session_exists()
+
     while True:
         time.sleep(SSO_SYNC_INTERVAL)
+        _ensure_session_exists()
         for username, session in list(_sessions.items()):
             try:
                 _log("info", f"Re-sync SSO token pour {username}...", "ssoSync")
