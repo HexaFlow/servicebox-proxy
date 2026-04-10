@@ -601,7 +601,7 @@ class ServiceBoxSession:
         steps: list[StepResult] = []
 
         # Step 4: Set basket
-        _log("info", f"Panier → dossier {dossier_id}...", "panier")
+        _log("info", f"Panier -> dossier {dossier_id}...", "panier")
         set_url = f"{self.base_url}/panier/panierSetCurrent.do?id={dossier_id}"
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -739,7 +739,7 @@ class ServiceBoxSession:
         _log("info", f"Debut fetch_estimation — dossier_id={dossier_id}, session user={self.username}", "fetchEstimation")
 
         # Step 1: Set basket to the given dossier
-        _log("info", f"Panier → dossier {dossier_id}...", "fetchEstimation")
+        _log("info", f"Panier -> dossier {dossier_id}...", "fetchEstimation")
         set_url = f"{self.base_url}/panier/panierSetCurrent.do?id={dossier_id}"
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
