@@ -1173,7 +1173,14 @@ def test_connection(creds: Credentials):
 def get_options(req: AgendaOptionsRequest):
     try:
         session = _get_session(req)
-        return session.get_agenda_options()
+        result = session.get_agenda_options()
+        # If both lists are empty, the session is likely stale — re-bootstrap once
+        if not result["receptionnaires"] and not result["equipes"]:
+            _log("warn", "Options vides, re-bootstrap de la session...", "options")
+            _sessions.pop(req.username, None)
+            session = _get_session(req)
+            result = session.get_agenda_options()
+        return result
     except HTTPException:
         raise
     except Exception as e:
