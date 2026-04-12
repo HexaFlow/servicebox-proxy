@@ -173,6 +173,14 @@ def _get_session_lock(username: str) -> threading.Lock:
         return _session_locks[username]
 
 
+def _acquire_or_busy(username: str):
+    """Try to acquire the session lock without blocking. Raises HTTP 423 if busy."""
+    lock = _get_session_lock(username)
+    if not lock.acquire(blocking=False):
+        raise HTTPException(423, "Une autre operation est en cours, veuillez patienter...")
+    return lock
+
+
 # ─── Pydantic models ─────────────────────────────────────────────────────
 
 class Credentials(BaseModel):
@@ -1453,8 +1461,8 @@ def test_connection(creds: Credentials):
 
     # Test 2: Can we authenticate and get a session?
     _log("info", "Test d'authentification...", "test")
-    lock = _get_session_lock(creds.username)
-    with lock:
+    lock = _acquire_or_busy(creds.username)
+    try:
         try:
             session = ServiceBoxSession(creds.username, creds.password)
             session.bootstrap()
@@ -1481,6 +1489,8 @@ def test_connection(creds: Credentials):
         except Exception as e:
             result.detail = f"Erreur d'authentification: {e}"
             _log("error", result.detail, "test")
+    finally:
+        lock.release()
 
     _ops_record(
         "test_connection", creds=creds,
@@ -1494,8 +1504,8 @@ def test_connection(creds: Credentials):
 @app.post("/options", response_model=AgendaOptionsResponse)
 def get_options(req: AgendaOptionsRequest):
     t0 = time.time()
-    lock = _get_session_lock(req.username)
-    with lock:
+    lock = _acquire_or_busy(req.username)
+    try:
         try:
             session = _get_session(req)
             result = session.get_agenda_options()
@@ -1518,13 +1528,15 @@ def get_options(req: AgendaOptionsRequest):
             traceback.print_exc()
             _ops_record("options", creds=req, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
             raise HTTPException(500, str(e))
+    finally:
+        lock.release()
 
 
 @app.post("/create-rdv", response_model=CreateRdvResponse)
 def create_rdv(req: CreateRdvRequest):
     t0 = time.time()
-    lock = _get_session_lock(req.username)
-    with lock:
+    lock = _acquire_or_busy(req.username)
+    try:
         try:
             session = _get_session(req)
             result = session.create_rdv(req)
@@ -1549,6 +1561,8 @@ def create_rdv(req: CreateRdvRequest):
             traceback.print_exc()
             _ops_record("create_rdv", creds=req, request_data=_ops_safe_request(req), success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
             return CreateRdvResponse(success=False, error=str(e))
+    finally:
+        lock.release()
 
 
 class SearchClientRequest(Credentials):
@@ -1567,8 +1581,8 @@ class SearchClientResponse(BaseModel):
 @app.post("/search-client", response_model=SearchClientResponse)
 def search_client(req: SearchClientRequest):
     t0 = time.time()
-    lock = _get_session_lock(req.username)
-    with lock:
+    lock = _acquire_or_busy(req.username)
+    try:
         try:
             session = _get_session(req)
             result = session._search_client_dms(req.phone, nom=req.nom)
@@ -1598,6 +1612,8 @@ def search_client(req: SearchClientRequest):
             traceback.print_exc()
             _ops_record("search_client", creds=req, request_data={"phone": req.phone, "nom": req.nom}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
             return SearchClientResponse(found=False, detail=str(e))
+    finally:
+        lock.release()
 
 
 class DeleteRdvRequest(Credentials):
@@ -1607,8 +1623,8 @@ class DeleteRdvRequest(Credentials):
 @app.post("/delete-rdv")
 def delete_rdv(req: DeleteRdvRequest):
     t0 = time.time()
-    lock = _get_session_lock(req.username)
-    with lock:
+    lock = _acquire_or_busy(req.username)
+    try:
         try:
             session = _get_session(req)
             result = session.delete_rdv(req.rdv_id)
@@ -1626,19 +1642,23 @@ def delete_rdv(req: DeleteRdvRequest):
             traceback.print_exc()
             _ops_record("delete_rdv", creds=req, request_data={"rdv_id": req.rdv_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
             return {"success": False, "error": str(e)}
+    finally:
+        lock.release()
 
 
 @app.post("/reset-session")
 def reset_session(creds: Credentials):
     """Force re-bootstrap (useful if session expired)."""
     t0 = time.time()
-    lock = _get_session_lock(creds.username)
-    with lock:
+    lock = _acquire_or_busy(creds.username)
+    try:
         key = creds.username
         _sessions.pop(key, None)
         session = _get_session(creds)
         _ops_record("reset_session", creds=creds, duration_ms=int((time.time() - t0) * 1000))
         return {"status": "ok"}
+    finally:
+        lock.release()
 
 
 @app.post("/debug-auth")
@@ -1945,8 +1965,8 @@ def debug_auth(creds: Credentials):
 @app.post("/fetch-estimation", response_model=FetchEstimationResponse)
 def fetch_estimation(req: FetchEstimationRequest):
     t0 = time.time()
-    lock = _get_session_lock(req.username)
-    with lock:
+    lock = _acquire_or_busy(req.username)
+    try:
         try:
             session = _get_session(req)
             result = session.fetch_estimation(req.dossier_id)
@@ -1962,6 +1982,8 @@ def fetch_estimation(req: FetchEstimationRequest):
             _log("error", str(e), "fetchEstimation")
             _ops_record("fetch_estimation", creds=req, request_data={"dossier_id": req.dossier_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
             return FetchEstimationResponse(success=False, error=str(e))
+    finally:
+        lock.release()
 
 
 # ─── Operations query endpoints ──────────────────────────────────────────
