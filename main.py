@@ -1306,6 +1306,30 @@ _log("info", f"SSO sync started (every {SSO_SYNC_INTERVAL // 60}min)", "ssoSync"
 
 # ─── Routes ──────────────────────────────────────────────────────────────
 
+@app.get("/help")
+def help_endpoint():
+    """List all available endpoints."""
+    return {"version": VERSION, "endpoints": [
+        {"method": "GET",  "path": "/health",            "description": "Statut du proxy (version, nb sessions)"},
+        {"method": "GET",  "path": "/help",              "description": "Liste des endpoints disponibles"},
+        {"method": "GET",  "path": "/logs",              "description": "Derniers logs en memoire (?limit=200)"},
+        {"method": "GET",  "path": "/docs",              "description": "Swagger UI (ouvrir dans un navigateur)"},
+        {"method": "GET",  "path": "/verify-browser",    "description": "Page HTML pour tester ServiceBox dans le navigateur"},
+        {"method": "POST", "path": "/test-connection",   "description": "Teste la connexion et l'authentification ServiceBox"},
+        {"method": "POST", "path": "/options",           "description": "Recupere receptionnaires + equipes pour creation RDV"},
+        {"method": "POST", "path": "/create-rdv",        "description": "Cree un RDV complet (client + vehicule + transfert Alpha)"},
+        {"method": "POST", "path": "/search-client",     "description": "Recherche un client existant dans Alpha DMS"},
+        {"method": "POST", "path": "/delete-rdv",        "description": "Supprime un RDV par ID"},
+        {"method": "POST", "path": "/reset-session",     "description": "Force le re-bootstrap de la session"},
+        {"method": "POST", "path": "/fetch-estimation",  "description": "Recupere le HTML d'estimation pour un dossier"},
+        {"method": "POST", "path": "/debug-auth",        "description": "Teste toutes les methodes d'auth (diagnostic)"},
+        {"method": "POST", "path": "/force-update",      "description": "Declenche une mise a jour immediate"},
+        {"method": "GET",  "path": "/operations",        "description": "Historique des operations (?operation=&username=&success=&date_from=&date_to=&limit=&offset=)"},
+        {"method": "GET",  "path": "/operations/export", "description": "Export JSON ou CSV (?format=csv&date_from=&date_to=)"},
+        {"method": "GET",  "path": "/operations/stats",  "description": "Statistiques par type d'operation (?date_from=&date_to=)"},
+    ]}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": VERSION, "sessions": len(_sessions)}
