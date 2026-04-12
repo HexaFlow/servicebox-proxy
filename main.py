@@ -82,6 +82,7 @@ def _ops_init():
             timestamp   TEXT    NOT NULL,
             operation   TEXT    NOT NULL,
             username    TEXT    NOT NULL DEFAULT '',
+            operator_email TEXT NOT NULL DEFAULT '',
             request_data TEXT   NOT NULL DEFAULT '{}',
             response_data TEXT  NOT NULL DEFAULT '{}',
             success     INTEGER NOT NULL DEFAULT 1,
@@ -95,6 +96,11 @@ def _ops_init():
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_ops_operation ON operations(operation)
     """)
+    # Migration: add operator_email column if DB was created before v3.8.0
+    try:
+        con.execute("ALTER TABLE operations ADD COLUMN operator_email TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     con.commit()
     con.close()
 
@@ -110,18 +116,24 @@ def _ops_record(
     success: bool = True,
     error: str = "",
     duration_ms: int = 0,
+    operator_email: str = "",
+    creds=None,
 ):
-    """Insert one operation record."""
+    """Insert one operation record. Pass creds to auto-extract username + operator_email."""
+    if creds is not None:
+        username = username or getattr(creds, "username", "")
+        operator_email = operator_email or getattr(creds, "operator_email", "") or ""
     try:
         con = sqlite3.connect(_ops_db_path())
         con.execute(
             """INSERT INTO operations
-               (timestamp, operation, username, request_data, response_data, success, error, duration_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (timestamp, operation, username, operator_email, request_data, response_data, success, error, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now(timezone.utc).isoformat(),
                 operation,
                 username,
+                operator_email,
                 json.dumps(request_data or {}, default=str),
                 json.dumps(response_data or {}, default=str),
                 1 if success else 0,
@@ -137,13 +149,28 @@ def _ops_record(
 
 def _ops_safe_request(req, exclude_fields: set | None = None) -> dict:
     """Extract loggable fields from a Pydantic request, excluding credentials."""
-    exclude = {"username", "password", "site_code"} | (exclude_fields or set())
+    exclude = {"username", "password", "site_code", "operator_email"} | (exclude_fields or set())
     return {k: v for k, v in req.dict().items() if k not in exclude}
+
+
+def _ops_from_creds(creds) -> dict:
+    """Extract common _ops_record kwargs from a Credentials-based request."""
+    return {"username": creds.username, "operator_email": getattr(creds, "operator_email", "") or ""}
 
 
 # ─── In-memory session cache (keyed by username) ─────────────────────────
 
 _sessions: dict[str, "ServiceBoxSession"] = {}
+_session_locks: dict[str, threading.Lock] = {}
+_session_locks_guard = threading.Lock()
+
+
+def _get_session_lock(username: str) -> threading.Lock:
+    """Get or create a per-username lock to serialize ServiceBox requests."""
+    with _session_locks_guard:
+        if username not in _session_locks:
+            _session_locks[username] = threading.Lock()
+        return _session_locks[username]
 
 
 # ─── Pydantic models ─────────────────────────────────────────────────────
@@ -152,6 +179,7 @@ class Credentials(BaseModel):
     username: str
     password: str
     site_code: Optional[str] = None
+    operator_email: Optional[str] = None  # Hexaflow user who triggered the action
 
 
 class AgendaOptionsRequest(Credentials):
@@ -1324,7 +1352,7 @@ def help_endpoint():
         {"method": "POST", "path": "/fetch-estimation",  "description": "Recupere le HTML d'estimation pour un dossier"},
         {"method": "POST", "path": "/debug-auth",        "description": "Teste toutes les methodes d'auth (diagnostic)"},
         {"method": "POST", "path": "/force-update",      "description": "Declenche une mise a jour immediate"},
-        {"method": "GET",  "path": "/operations",        "description": "Historique des operations (?operation=&username=&success=&date_from=&date_to=&limit=&offset=)"},
+        {"method": "GET",  "path": "/operations",        "description": "Historique des operations (?operation=&username=&operator_email=&success=&date_from=&date_to=&limit=&offset=)"},
         {"method": "GET",  "path": "/operations/export", "description": "Export JSON ou CSV (?format=csv&date_from=&date_to=)"},
         {"method": "GET",  "path": "/operations/stats",  "description": "Statistiques par type d'operation (?date_from=&date_to=)"},
     ]}
@@ -1420,40 +1448,42 @@ def test_connection(creds: Credentials):
     except Exception as e:
         _log("error", f"Injoignable: {e}", "test")
         result.detail = f"ServiceBox injoignable: {e}"
-        _ops_record("test_connection", creds.username, success=False, error=result.detail, duration_ms=int((time.time() - t0) * 1000))
+        _ops_record("test_connection", creds=creds, success=False, error=result.detail, duration_ms=int((time.time() - t0) * 1000))
         return result
 
     # Test 2: Can we authenticate and get a session?
     _log("info", "Test d'authentification...", "test")
-    try:
-        session = ServiceBoxSession(creds.username, creds.password)
-        session.bootstrap()
+    lock = _get_session_lock(creds.username)
+    with lock:
+        try:
+            session = ServiceBoxSession(creds.username, creds.password)
+            session.bootstrap()
 
-        # Try to load the agenda page — if auth works, we get HTML with our user info
-        test_resp = session.session.get(
-            f"{session.base_url}/agenda/planningReceptionnaire.action",
-            timeout=15,
-        )
-        _log("info", f"Reponse auth: HTTP {test_resp.status_code} ({len(test_resp.text)} bytes)", "test")
-        if test_resp.status_code == 200 and len(test_resp.text) > 500:
-            result.session_ok = True
-            result.connected = True
-            result.detail = "Connexion et authentification OK"
-            _log("info", "Authentification OK", "test")
-            # Cache the session
-            _sessions[creds.username] = session
-        elif test_resp.status_code == 401:
-            result.detail = "Identifiants ServiceBox incorrects (HTTP 401). Verifiez username/password dans les parametres."
+            # Try to load the agenda page — if auth works, we get HTML with our user info
+            test_resp = session.session.get(
+                f"{session.base_url}/agenda/planningReceptionnaire.action",
+                timeout=15,
+            )
+            _log("info", f"Reponse auth: HTTP {test_resp.status_code} ({len(test_resp.text)} bytes)", "test")
+            if test_resp.status_code == 200 and len(test_resp.text) > 500:
+                result.session_ok = True
+                result.connected = True
+                result.detail = "Connexion et authentification OK"
+                _log("info", "Authentification OK", "test")
+                # Cache the session
+                _sessions[creds.username] = session
+            elif test_resp.status_code == 401:
+                result.detail = "Identifiants ServiceBox incorrects (HTTP 401). Verifiez username/password dans les parametres."
+                _log("error", result.detail, "test")
+            else:
+                result.detail = f"Authentification echouee (HTTP {test_resp.status_code}, {len(test_resp.text)} bytes)"
+                _log("error", result.detail, "test")
+        except Exception as e:
+            result.detail = f"Erreur d'authentification: {e}"
             _log("error", result.detail, "test")
-        else:
-            result.detail = f"Authentification echouee (HTTP {test_resp.status_code}, {len(test_resp.text)} bytes)"
-            _log("error", result.detail, "test")
-    except Exception as e:
-        result.detail = f"Erreur d'authentification: {e}"
-        _log("error", result.detail, "test")
 
     _ops_record(
-        "test_connection", creds.username,
+        "test_connection", creds=creds,
         response_data={"connected": result.connected, "session_ok": result.session_ok, "detail": result.detail},
         success=result.connected, error="" if result.connected else result.detail,
         duration_ms=int((time.time() - t0) * 1000),
@@ -1464,57 +1494,61 @@ def test_connection(creds: Credentials):
 @app.post("/options", response_model=AgendaOptionsResponse)
 def get_options(req: AgendaOptionsRequest):
     t0 = time.time()
-    try:
-        session = _get_session(req)
-        result = session.get_agenda_options()
-        # If both lists are empty, the session is likely stale — re-bootstrap once
-        if not result["receptionnaires"] and not result["equipes"]:
-            _log("warn", "Options vides, re-bootstrap de la session...", "options")
-            _sessions.pop(req.username, None)
+    lock = _get_session_lock(req.username)
+    with lock:
+        try:
             session = _get_session(req)
             result = session.get_agenda_options()
-        _ops_record(
-            "options", req.username,
-            response_data={"receptionnaires": len(result["receptionnaires"]), "equipes": len(result["equipes"])},
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        return result
-    except HTTPException:
-        _ops_record("options", req.username, success=False, error="HTTPException", duration_ms=int((time.time() - t0) * 1000))
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        _ops_record("options", req.username, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
-        raise HTTPException(500, str(e))
+            # If both lists are empty, the session is likely stale — re-bootstrap once
+            if not result["receptionnaires"] and not result["equipes"]:
+                _log("warn", "Options vides, re-bootstrap de la session...", "options")
+                _sessions.pop(req.username, None)
+                session = _get_session(req)
+                result = session.get_agenda_options()
+            _ops_record(
+                "options", creds=req,
+                response_data={"receptionnaires": len(result["receptionnaires"]), "equipes": len(result["equipes"])},
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+            return result
+        except HTTPException:
+            _ops_record("options", creds=req, success=False, error="HTTPException", duration_ms=int((time.time() - t0) * 1000))
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            _ops_record("options", creds=req, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
+            raise HTTPException(500, str(e))
 
 
 @app.post("/create-rdv", response_model=CreateRdvResponse)
 def create_rdv(req: CreateRdvRequest):
     t0 = time.time()
-    try:
-        session = _get_session(req)
-        result = session.create_rdv(req)
-        _ops_record(
-            "create_rdv", req.username,
-            request_data=_ops_safe_request(req),
-            response_data={
-                "success": result.success,
-                "or_number": result.or_number,
-                "dossier_id": result.dossier_id,
-                "rdv_id": result.rdv_id,
-                "client_id": result.client_id,
-                "error": result.error,
-                "steps": [s.dict() for s in result.steps],
-            },
-            success=result.success,
-            error=result.error or "",
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        _ops_record("create_rdv", req.username, request_data=_ops_safe_request(req), success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
-        return CreateRdvResponse(success=False, error=str(e))
+    lock = _get_session_lock(req.username)
+    with lock:
+        try:
+            session = _get_session(req)
+            result = session.create_rdv(req)
+            _ops_record(
+                "create_rdv", creds=req,
+                request_data=_ops_safe_request(req),
+                response_data={
+                    "success": result.success,
+                    "or_number": result.or_number,
+                    "dossier_id": result.dossier_id,
+                    "rdv_id": result.rdv_id,
+                    "client_id": result.client_id,
+                    "error": result.error,
+                    "steps": [s.dict() for s in result.steps],
+                },
+                success=result.success,
+                error=result.error or "",
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+            return result
+        except Exception as e:
+            traceback.print_exc()
+            _ops_record("create_rdv", creds=req, request_data=_ops_safe_request(req), success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
+            return CreateRdvResponse(success=False, error=str(e))
 
 
 class SearchClientRequest(Credentials):
@@ -1533,35 +1567,37 @@ class SearchClientResponse(BaseModel):
 @app.post("/search-client", response_model=SearchClientResponse)
 def search_client(req: SearchClientRequest):
     t0 = time.time()
-    try:
-        session = _get_session(req)
-        result = session._search_client_dms(req.phone, nom=req.nom)
-        if result:
-            resp = SearchClientResponse(
-                found=True,
-                dms_id=result["dms_id"],
-                nom=result["nom"],
-                prenom=result["prenom"],
-                detail=f"Client DMS: {result['prenom']} {result['nom']} (id={result['dms_id']})",
-            )
+    lock = _get_session_lock(req.username)
+    with lock:
+        try:
+            session = _get_session(req)
+            result = session._search_client_dms(req.phone, nom=req.nom)
+            if result:
+                resp = SearchClientResponse(
+                    found=True,
+                    dms_id=result["dms_id"],
+                    nom=result["nom"],
+                    prenom=result["prenom"],
+                    detail=f"Client DMS: {result['prenom']} {result['nom']} (id={result['dms_id']})",
+                )
+                _ops_record(
+                    "search_client", creds=req,
+                    request_data={"phone": req.phone, "nom": req.nom},
+                    response_data={"found": True, "dms_id": result["dms_id"], "nom": result["nom"], "prenom": result["prenom"]},
+                    duration_ms=int((time.time() - t0) * 1000),
+                )
+                return resp
             _ops_record(
-                "search_client", req.username,
+                "search_client", creds=req,
                 request_data={"phone": req.phone, "nom": req.nom},
-                response_data={"found": True, "dms_id": result["dms_id"], "nom": result["nom"], "prenom": result["prenom"]},
+                response_data={"found": False},
                 duration_ms=int((time.time() - t0) * 1000),
             )
-            return resp
-        _ops_record(
-            "search_client", req.username,
-            request_data={"phone": req.phone, "nom": req.nom},
-            response_data={"found": False},
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        return SearchClientResponse(found=False, detail="Aucun client trouve")
-    except Exception as e:
-        traceback.print_exc()
-        _ops_record("search_client", req.username, request_data={"phone": req.phone, "nom": req.nom}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
-        return SearchClientResponse(found=False, detail=str(e))
+            return SearchClientResponse(found=False, detail="Aucun client trouve")
+        except Exception as e:
+            traceback.print_exc()
+            _ops_record("search_client", creds=req, request_data={"phone": req.phone, "nom": req.nom}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
+            return SearchClientResponse(found=False, detail=str(e))
 
 
 class DeleteRdvRequest(Credentials):
@@ -1571,34 +1607,38 @@ class DeleteRdvRequest(Credentials):
 @app.post("/delete-rdv")
 def delete_rdv(req: DeleteRdvRequest):
     t0 = time.time()
-    try:
-        session = _get_session(req)
-        result = session.delete_rdv(req.rdv_id)
-        is_ok = result.get("success", False) if isinstance(result, dict) else True
-        _ops_record(
-            "delete_rdv", req.username,
-            request_data={"rdv_id": req.rdv_id},
-            response_data=result if isinstance(result, dict) else {"result": str(result)},
-            success=is_ok,
-            error=result.get("error", "") if isinstance(result, dict) and not is_ok else "",
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        _ops_record("delete_rdv", req.username, request_data={"rdv_id": req.rdv_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
-        return {"success": False, "error": str(e)}
+    lock = _get_session_lock(req.username)
+    with lock:
+        try:
+            session = _get_session(req)
+            result = session.delete_rdv(req.rdv_id)
+            is_ok = result.get("success", False) if isinstance(result, dict) else True
+            _ops_record(
+                "delete_rdv", creds=req,
+                request_data={"rdv_id": req.rdv_id},
+                response_data=result if isinstance(result, dict) else {"result": str(result)},
+                success=is_ok,
+                error=result.get("error", "") if isinstance(result, dict) and not is_ok else "",
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+            return result
+        except Exception as e:
+            traceback.print_exc()
+            _ops_record("delete_rdv", creds=req, request_data={"rdv_id": req.rdv_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
+            return {"success": False, "error": str(e)}
 
 
 @app.post("/reset-session")
 def reset_session(creds: Credentials):
     """Force re-bootstrap (useful if session expired)."""
     t0 = time.time()
-    key = creds.username
-    _sessions.pop(key, None)
-    session = _get_session(creds)
-    _ops_record("reset_session", creds.username, duration_ms=int((time.time() - t0) * 1000))
-    return {"status": "ok"}
+    lock = _get_session_lock(creds.username)
+    with lock:
+        key = creds.username
+        _sessions.pop(key, None)
+        session = _get_session(creds)
+        _ops_record("reset_session", creds=creds, duration_ms=int((time.time() - t0) * 1000))
+        return {"status": "ok"}
 
 
 @app.post("/debug-auth")
@@ -1905,21 +1945,23 @@ def debug_auth(creds: Credentials):
 @app.post("/fetch-estimation", response_model=FetchEstimationResponse)
 def fetch_estimation(req: FetchEstimationRequest):
     t0 = time.time()
-    try:
-        session = _get_session(req)
-        result = session.fetch_estimation(req.dossier_id)
-        _ops_record(
-            "fetch_estimation", req.username,
-            request_data={"dossier_id": req.dossier_id},
-            response_data={"success": result.success, "has_html": result.html is not None, "error": result.error},
-            success=result.success, error=result.error or "",
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        return result
-    except Exception as e:
-        _log("error", str(e), "fetchEstimation")
-        _ops_record("fetch_estimation", req.username, request_data={"dossier_id": req.dossier_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
-        return FetchEstimationResponse(success=False, error=str(e))
+    lock = _get_session_lock(req.username)
+    with lock:
+        try:
+            session = _get_session(req)
+            result = session.fetch_estimation(req.dossier_id)
+            _ops_record(
+                "fetch_estimation", creds=req,
+                request_data={"dossier_id": req.dossier_id},
+                response_data={"success": result.success, "has_html": result.html is not None, "error": result.error},
+                success=result.success, error=result.error or "",
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+            return result
+        except Exception as e:
+            _log("error", str(e), "fetchEstimation")
+            _ops_record("fetch_estimation", creds=req, request_data={"dossier_id": req.dossier_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
+            return FetchEstimationResponse(success=False, error=str(e))
 
 
 # ─── Operations query endpoints ──────────────────────────────────────────
@@ -1928,6 +1970,7 @@ def fetch_estimation(req: FetchEstimationRequest):
 def get_operations(
     operation: Optional[str] = None,
     username: Optional[str] = None,
+    operator_email: Optional[str] = None,
     success: Optional[bool] = None,
     date_from: Optional[str] = None,   # ISO date, e.g. 2026-04-01
     date_to: Optional[str] = None,     # ISO date, e.g. 2026-04-12
@@ -1944,6 +1987,9 @@ def get_operations(
     if username:
         clauses.append("username = ?")
         params.append(username)
+    if operator_email:
+        clauses.append("operator_email = ?")
+        params.append(operator_email)
     if success is not None:
         clauses.append("success = ?")
         params.append(1 if success else 0)
@@ -1971,6 +2017,7 @@ def get_operations(
             "timestamp": r["timestamp"],
             "operation": r["operation"],
             "username": r["username"],
+            "operator_email": r["operator_email"],
             "request_data": json.loads(r["request_data"]),
             "response_data": json.loads(r["response_data"]),
             "success": bool(r["success"]),
@@ -2007,9 +2054,9 @@ def export_operations(
         import io
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["id", "timestamp", "operation", "username", "request_data", "response_data", "success", "error", "duration_ms"])
+        writer.writerow(["id", "timestamp", "operation", "username", "operator_email", "request_data", "response_data", "success", "error", "duration_ms"])
         for r in rows:
-            writer.writerow([r["id"], r["timestamp"], r["operation"], r["username"], r["request_data"], r["response_data"], bool(r["success"]), r["error"], r["duration_ms"]])
+            writer.writerow([r["id"], r["timestamp"], r["operation"], r["username"], r["operator_email"], r["request_data"], r["response_data"], bool(r["success"]), r["error"], r["duration_ms"]])
         return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=operations.csv"})
 
     items = []
@@ -2019,6 +2066,7 @@ def export_operations(
             "timestamp": r["timestamp"],
             "operation": r["operation"],
             "username": r["username"],
+            "operator_email": r["operator_email"],
             "request_data": json.loads(r["request_data"]),
             "response_data": json.loads(r["response_data"]),
             "success": bool(r["success"]),
