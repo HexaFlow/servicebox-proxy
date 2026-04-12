@@ -7,9 +7,11 @@ with ServiceBox + Alpha DMS.
 
 import base64
 import ctypes
+import os
 import re
 import json
 import random
+import sqlite3
 import subprocess
 import sys
 import time
@@ -58,6 +60,85 @@ def _log(level: str, message: str, step: str = ""):
     _log_entries.append(entry)
     prefix = f"[{step}] " if step else ""
     print(f"[{level.upper()}] {prefix}{message}")
+
+
+# ─── Operations database (SQLite) ───────────────────────────────────────
+
+def _ops_db_path() -> str:
+    """Database file sits next to the executable (or script)."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "operations.db")
+
+
+def _ops_init():
+    """Create the operations table if it doesn't exist."""
+    con = sqlite3.connect(_ops_db_path())
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS operations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT    NOT NULL,
+            operation   TEXT    NOT NULL,
+            username    TEXT    NOT NULL DEFAULT '',
+            request_data TEXT   NOT NULL DEFAULT '{}',
+            response_data TEXT  NOT NULL DEFAULT '{}',
+            success     INTEGER NOT NULL DEFAULT 1,
+            error       TEXT    NOT NULL DEFAULT '',
+            duration_ms INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ops_timestamp ON operations(timestamp)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ops_operation ON operations(operation)
+    """)
+    con.commit()
+    con.close()
+
+
+_ops_init()
+
+
+def _ops_record(
+    operation: str,
+    username: str = "",
+    request_data: dict | None = None,
+    response_data: dict | None = None,
+    success: bool = True,
+    error: str = "",
+    duration_ms: int = 0,
+):
+    """Insert one operation record."""
+    try:
+        con = sqlite3.connect(_ops_db_path())
+        con.execute(
+            """INSERT INTO operations
+               (timestamp, operation, username, request_data, response_data, success, error, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                operation,
+                username,
+                json.dumps(request_data or {}, default=str),
+                json.dumps(response_data or {}, default=str),
+                1 if success else 0,
+                error,
+                duration_ms,
+            ),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        _log("error", f"Echec enregistrement operation: {e}", "ops")
+
+
+def _ops_safe_request(req, exclude_fields: set | None = None) -> dict:
+    """Extract loggable fields from a Pydantic request, excluding credentials."""
+    exclude = {"username", "password", "site_code"} | (exclude_fields or set())
+    return {k: v for k, v in req.dict().items() if k not in exclude}
 
 
 # ─── In-memory session cache (keyed by username) ─────────────────────────
@@ -1302,6 +1383,7 @@ def get_logs(limit: int = 200):
 @app.post("/test-connection", response_model=TestConnectionResponse)
 def test_connection(creds: Credentials):
     """Test that we can reach ServiceBox and authenticate."""
+    t0 = time.time()
     result = TestConnectionResponse(connected=False, session_ok=False, servicebox_reachable=False)
 
     # Test 1: Can we reach servicebox.mpsa.com at all?
@@ -1314,6 +1396,7 @@ def test_connection(creds: Credentials):
     except Exception as e:
         _log("error", f"Injoignable: {e}", "test")
         result.detail = f"ServiceBox injoignable: {e}"
+        _ops_record("test_connection", creds.username, success=False, error=result.detail, duration_ms=int((time.time() - t0) * 1000))
         return result
 
     # Test 2: Can we authenticate and get a session?
@@ -1345,11 +1428,18 @@ def test_connection(creds: Credentials):
         result.detail = f"Erreur d'authentification: {e}"
         _log("error", result.detail, "test")
 
+    _ops_record(
+        "test_connection", creds.username,
+        response_data={"connected": result.connected, "session_ok": result.session_ok, "detail": result.detail},
+        success=result.connected, error="" if result.connected else result.detail,
+        duration_ms=int((time.time() - t0) * 1000),
+    )
     return result
 
 
 @app.post("/options", response_model=AgendaOptionsResponse)
 def get_options(req: AgendaOptionsRequest):
+    t0 = time.time()
     try:
         session = _get_session(req)
         result = session.get_agenda_options()
@@ -1359,21 +1449,47 @@ def get_options(req: AgendaOptionsRequest):
             _sessions.pop(req.username, None)
             session = _get_session(req)
             result = session.get_agenda_options()
+        _ops_record(
+            "options", req.username,
+            response_data={"receptionnaires": len(result["receptionnaires"]), "equipes": len(result["equipes"])},
+            duration_ms=int((time.time() - t0) * 1000),
+        )
         return result
     except HTTPException:
+        _ops_record("options", req.username, success=False, error="HTTPException", duration_ms=int((time.time() - t0) * 1000))
         raise
     except Exception as e:
         traceback.print_exc()
+        _ops_record("options", req.username, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
         raise HTTPException(500, str(e))
 
 
 @app.post("/create-rdv", response_model=CreateRdvResponse)
 def create_rdv(req: CreateRdvRequest):
+    t0 = time.time()
     try:
         session = _get_session(req)
-        return session.create_rdv(req)
+        result = session.create_rdv(req)
+        _ops_record(
+            "create_rdv", req.username,
+            request_data=_ops_safe_request(req),
+            response_data={
+                "success": result.success,
+                "or_number": result.or_number,
+                "dossier_id": result.dossier_id,
+                "rdv_id": result.rdv_id,
+                "client_id": result.client_id,
+                "error": result.error,
+                "steps": [s.dict() for s in result.steps],
+            },
+            success=result.success,
+            error=result.error or "",
+            duration_ms=int((time.time() - t0) * 1000),
+        )
+        return result
     except Exception as e:
         traceback.print_exc()
+        _ops_record("create_rdv", req.username, request_data=_ops_safe_request(req), success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
         return CreateRdvResponse(success=False, error=str(e))
 
 
@@ -1392,20 +1508,35 @@ class SearchClientResponse(BaseModel):
 
 @app.post("/search-client", response_model=SearchClientResponse)
 def search_client(req: SearchClientRequest):
+    t0 = time.time()
     try:
         session = _get_session(req)
         result = session._search_client_dms(req.phone, nom=req.nom)
         if result:
-            return SearchClientResponse(
+            resp = SearchClientResponse(
                 found=True,
                 dms_id=result["dms_id"],
                 nom=result["nom"],
                 prenom=result["prenom"],
                 detail=f"Client DMS: {result['prenom']} {result['nom']} (id={result['dms_id']})",
             )
+            _ops_record(
+                "search_client", req.username,
+                request_data={"phone": req.phone, "nom": req.nom},
+                response_data={"found": True, "dms_id": result["dms_id"], "nom": result["nom"], "prenom": result["prenom"]},
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+            return resp
+        _ops_record(
+            "search_client", req.username,
+            request_data={"phone": req.phone, "nom": req.nom},
+            response_data={"found": False},
+            duration_ms=int((time.time() - t0) * 1000),
+        )
         return SearchClientResponse(found=False, detail="Aucun client trouve")
     except Exception as e:
         traceback.print_exc()
+        _ops_record("search_client", req.username, request_data={"phone": req.phone, "nom": req.nom}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
         return SearchClientResponse(found=False, detail=str(e))
 
 
@@ -1415,20 +1546,34 @@ class DeleteRdvRequest(Credentials):
 
 @app.post("/delete-rdv")
 def delete_rdv(req: DeleteRdvRequest):
+    t0 = time.time()
     try:
         session = _get_session(req)
-        return session.delete_rdv(req.rdv_id)
+        result = session.delete_rdv(req.rdv_id)
+        is_ok = result.get("success", False) if isinstance(result, dict) else True
+        _ops_record(
+            "delete_rdv", req.username,
+            request_data={"rdv_id": req.rdv_id},
+            response_data=result if isinstance(result, dict) else {"result": str(result)},
+            success=is_ok,
+            error=result.get("error", "") if isinstance(result, dict) and not is_ok else "",
+            duration_ms=int((time.time() - t0) * 1000),
+        )
+        return result
     except Exception as e:
         traceback.print_exc()
+        _ops_record("delete_rdv", req.username, request_data={"rdv_id": req.rdv_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
         return {"success": False, "error": str(e)}
 
 
 @app.post("/reset-session")
 def reset_session(creds: Credentials):
     """Force re-bootstrap (useful if session expired)."""
+    t0 = time.time()
     key = creds.username
     _sessions.pop(key, None)
     session = _get_session(creds)
+    _ops_record("reset_session", creds.username, duration_ms=int((time.time() - t0) * 1000))
     return {"status": "ok"}
 
 
@@ -1735,13 +1880,182 @@ def debug_auth(creds: Credentials):
 
 @app.post("/fetch-estimation", response_model=FetchEstimationResponse)
 def fetch_estimation(req: FetchEstimationRequest):
+    t0 = time.time()
     try:
         session = _get_session(req)
         result = session.fetch_estimation(req.dossier_id)
+        _ops_record(
+            "fetch_estimation", req.username,
+            request_data={"dossier_id": req.dossier_id},
+            response_data={"success": result.success, "has_html": result.html is not None, "error": result.error},
+            success=result.success, error=result.error or "",
+            duration_ms=int((time.time() - t0) * 1000),
+        )
         return result
     except Exception as e:
         _log("error", str(e), "fetchEstimation")
+        _ops_record("fetch_estimation", req.username, request_data={"dossier_id": req.dossier_id}, success=False, error=str(e), duration_ms=int((time.time() - t0) * 1000))
         return FetchEstimationResponse(success=False, error=str(e))
+
+
+# ─── Operations query endpoints ──────────────────────────────────────────
+
+@app.get("/operations")
+def get_operations(
+    operation: Optional[str] = None,
+    username: Optional[str] = None,
+    success: Optional[bool] = None,
+    date_from: Optional[str] = None,   # ISO date, e.g. 2026-04-01
+    date_to: Optional[str] = None,     # ISO date, e.g. 2026-04-12
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Query operations with optional filters. Returns newest first."""
+    con = sqlite3.connect(_ops_db_path())
+    con.row_factory = sqlite3.Row
+    clauses, params = [], []
+    if operation:
+        clauses.append("operation = ?")
+        params.append(operation)
+    if username:
+        clauses.append("username = ?")
+        params.append(username)
+    if success is not None:
+        clauses.append("success = ?")
+        params.append(1 if success else 0)
+    if date_from:
+        clauses.append("timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("timestamp < ?")
+        params.append(date_to + "T23:59:59")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    # Total count
+    total = con.execute(f"SELECT COUNT(*) FROM operations{where}", params).fetchone()[0]
+
+    rows = con.execute(
+        f"SELECT * FROM operations{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    ).fetchall()
+    con.close()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "operation": r["operation"],
+            "username": r["username"],
+            "request_data": json.loads(r["request_data"]),
+            "response_data": json.loads(r["response_data"]),
+            "success": bool(r["success"]),
+            "error": r["error"],
+            "duration_ms": r["duration_ms"],
+        })
+    return {"total": total, "limit": limit, "offset": offset, "operations": items}
+
+
+@app.get("/operations/export")
+def export_operations(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    format: str = "json",  # "json" or "csv"
+):
+    """Export all operations for a date range as JSON array or CSV."""
+    con = sqlite3.connect(_ops_db_path())
+    con.row_factory = sqlite3.Row
+    clauses, params = [], []
+    if date_from:
+        clauses.append("timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("timestamp < ?")
+        params.append(date_to + "T23:59:59")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    rows = con.execute(f"SELECT * FROM operations{where} ORDER BY id DESC", params).fetchall()
+    con.close()
+
+    if format == "csv":
+        from fastapi.responses import PlainTextResponse
+        import csv
+        import io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id", "timestamp", "operation", "username", "request_data", "response_data", "success", "error", "duration_ms"])
+        for r in rows:
+            writer.writerow([r["id"], r["timestamp"], r["operation"], r["username"], r["request_data"], r["response_data"], bool(r["success"]), r["error"], r["duration_ms"]])
+        return PlainTextResponse(buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=operations.csv"})
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "operation": r["operation"],
+            "username": r["username"],
+            "request_data": json.loads(r["request_data"]),
+            "response_data": json.loads(r["response_data"]),
+            "success": bool(r["success"]),
+            "error": r["error"],
+            "duration_ms": r["duration_ms"],
+        })
+    return {"operations": items}
+
+
+@app.get("/operations/stats")
+def operations_stats(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Summary counts per operation type, success rate, average duration."""
+    con = sqlite3.connect(_ops_db_path())
+    clauses, params = [], []
+    if date_from:
+        clauses.append("timestamp >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("timestamp < ?")
+        params.append(date_to + "T23:59:59")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    rows = con.execute(f"""
+        SELECT operation,
+               COUNT(*)           AS total,
+               SUM(success)       AS successes,
+               COUNT(*) - SUM(success) AS failures,
+               ROUND(AVG(duration_ms)) AS avg_duration_ms
+        FROM operations{where}
+        GROUP BY operation
+        ORDER BY total DESC
+    """, params).fetchall()
+
+    total_row = con.execute(f"""
+        SELECT COUNT(*) AS total, SUM(success) AS successes,
+               ROUND(AVG(duration_ms)) AS avg_duration_ms
+        FROM operations{where}
+    """, params).fetchone()
+    con.close()
+
+    by_operation = []
+    for r in rows:
+        by_operation.append({
+            "operation": r[0],
+            "total": r[1],
+            "successes": r[2],
+            "failures": r[3],
+            "success_rate": round(r[2] / r[1] * 100, 1) if r[1] else 0,
+            "avg_duration_ms": int(r[4] or 0),
+        })
+
+    return {
+        "total": total_row[0],
+        "successes": total_row[1] or 0,
+        "failures": (total_row[0] or 0) - (total_row[1] or 0),
+        "avg_duration_ms": int(total_row[2] or 0),
+        "by_operation": by_operation,
+    }
 
 
 if __name__ == "__main__":
