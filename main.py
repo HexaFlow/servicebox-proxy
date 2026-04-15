@@ -960,44 +960,122 @@ class ServiceBoxSession:
 
         _log("info", "panierSetCurrent OK", "fetchEstimation")
 
-        # Step 2: Navigate to Valorisation page to trigger price computation
-        _log("info", "Requete panierValorisation.do (trigger prices)...", "fetchEstimation")
+        # Step 2: POST panierValorisation.do (ajax=true) to get DMS request form
+        _log("info", "Requete panierValorisation.do (ajax=true)...", "fetchEstimation")
         valo_url = f"{self.base_url}/panier/panierValorisation.do"
         valo_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
             "Referer": set_url,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
         }
         try:
-            resp = self.session.get(valo_url, headers=valo_headers)
+            resp = self.session.post(valo_url, data="ajax=true", headers=valo_headers)
         except Exception as e:
             _log("error", f"Exception panierValorisation: {e}", "fetchEstimation")
             return FetchEstimationResponse(success=False, error=f"panierValorisation exception: {e}")
 
         _log("info", f"panierValorisation status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
-        if resp.status_code != 200:
-            _log("warn", f"panierValorisation HTTP {resp.status_code} — continuing anyway", "fetchEstimation")
 
-        # Step 3: Fetch panierDisplay.do (has all prices after valorisation)
-        _log("info", "Requete panierDisplay.do...", "fetchEstimation")
-        display_url = f"{self.base_url}/panier/panierDisplay.do"
-        display_headers = {
-            "Referer": valo_url,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        # Parse the DMS form from the response to get DMS URL and XML payload
+        from html.parser import HTMLParser
+        import urllib.parse
+
+        class FormParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.action = None
+                self.fields = {}
+            def handle_starttag(self, tag, attrs):
+                attrs_dict = dict(attrs)
+                if tag == "form" and attrs_dict.get("name") == "request":
+                    self.action = attrs_dict.get("action", "")
+                if tag == "input" and attrs_dict.get("type") == "hidden":
+                    name = attrs_dict.get("name", "")
+                    value = attrs_dict.get("value", "")
+                    if name:
+                        self.fields[name] = value
+
+        form_parser = FormParser()
+        form_parser.feed(resp.text)
+        dms_url = form_parser.action
+        dms_fields = form_parser.fields
+
+        if not dms_url or "xml" not in dms_fields:
+            _log("warn", f"No DMS form found in panierValorisation response — falling back to panierDisplay.do", "fetchEstimation")
+            # Fallback: just get panierDisplay.do without DMS prices
+            display_url = f"{self.base_url}/panier/panierDisplay.do"
+            resp = self.session.get(display_url, headers={"Referer": valo_url, "Accept": "text/html,*/*;q=0.8"})
+            return FetchEstimationResponse(success=True, html=resp.text)
+
+        _log("info", f"DMS form found — action={dms_url}, fields={list(dms_fields.keys())}", "fetchEstimation")
+
+        # Step 3: POST to Alpha DMS to get pricing
+        _log("info", f"Requete Alpha DMS: {dms_url}...", "fetchEstimation")
+        dms_body = urllib.parse.urlencode({
+            "ajax": "true",
+            "page": "11",
+            "version": "",
+            "urlResp": dms_fields.get("urlResp", f"{self.base_url}/panier/dmsResponse.do"),
+            "xml": dms_fields.get("xml", ""),
+        })
+        dms_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html, */*; q=0.01",
         }
         try:
-            resp = self.session.get(display_url, headers=display_headers)
+            dms_resp = self.session.post(dms_url, data=dms_body, headers=dms_headers, verify=False)
         except Exception as e:
-            _log("error", f"Exception panierDisplay: {e}", "fetchEstimation")
-            return FetchEstimationResponse(success=False, error=f"panierDisplay exception: {e}")
+            _log("error", f"Exception DMS call: {e}", "fetchEstimation")
+            _log("warn", "DMS unreachable — falling back to panierDisplay.do without DMS prices", "fetchEstimation")
+            display_url = f"{self.base_url}/panier/panierDisplay.do"
+            resp = self.session.get(display_url, headers={"Referer": valo_url, "Accept": "text/html,*/*;q=0.8"})
+            return FetchEstimationResponse(success=True, html=resp.text)
 
-        _log("info", f"panierDisplay status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
-        if resp.status_code != 200:
-            _log("error", f"Echec panierDisplay HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
-            return FetchEstimationResponse(success=False, error=f"panierDisplay HTTP {resp.status_code}")
+        _log("info", f"DMS response status={dms_resp.status_code}, taille={len(dms_resp.text)}", "fetchEstimation")
 
-        html = resp.text
-        has_prices = "***" not in html or "priceHT" in html
-        _log("info", f"panierDisplay OK — {len(html)} bytes, has_prices={has_prices}, contient 'listePR_': {'listePR_' in html}, contient 'listeMO_': {'listeMO_' in html}", "fetchEstimation")
+        # Parse DMS response — it's an HTML form that auto-submits to dmsResponse.do
+        dms_form_parser = FormParser()
+        dms_form_parser.feed(dms_resp.text)
+        dms_response_xml = dms_form_parser.fields.get("xml", "")
+
+        if not dms_response_xml:
+            _log("warn", "No XML in DMS response — falling back to panierDisplay.do", "fetchEstimation")
+            display_url = f"{self.base_url}/panier/panierDisplay.do"
+            resp = self.session.get(display_url, headers={"Referer": valo_url, "Accept": "text/html,*/*;q=0.8"})
+            return FetchEstimationResponse(success=True, html=resp.text)
+
+        _log("info", f"DMS response XML length: {len(dms_response_xml)}", "fetchEstimation")
+
+        # Step 4: POST dmsResponse.do with the pricing XML to get final page
+        _log("info", "Requete dmsResponse.do with DMS pricing...", "fetchEstimation")
+        dms_resp_url = f"{self.base_url}/panier/dmsResponse.do"
+        dms_resp_body = urllib.parse.urlencode({
+            "ajax": "true",
+            "origine": "",
+            "current": "",
+            "xml": dms_response_xml,
+            "type": "11",
+            "typeInterrogation": "",
+            "typeRecherche": "",
+        })
+        dms_resp_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": valo_url,
+            "Accept": "text/html, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            final_resp = self.session.post(dms_resp_url, data=dms_resp_body, headers=dms_resp_headers)
+        except Exception as e:
+            _log("error", f"Exception dmsResponse: {e}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"dmsResponse exception: {e}")
+
+        _log("info", f"dmsResponse status={final_resp.status_code}, taille={len(final_resp.text)}", "fetchEstimation")
+
+        html = final_resp.text
+        has_stars = "***" in html
+        _log("info", f"Final page — {len(html)} bytes, has_***: {has_stars}, contient 'listePR_': {'listePR_' in html}, contient 'listeMO_': {'listeMO_' in html}, contient 'totalHT': {'totalHT' in html}", "fetchEstimation")
 
         return FetchEstimationResponse(success=True, html=html)
 
