@@ -960,30 +960,30 @@ class ServiceBoxSession:
 
         _log("info", "panierSetCurrent OK", "fetchEstimation")
 
-        # Step 2: Fetch basket display HTML
-        _log("info", "Requete panierDisplay.do...", "fetchEstimation")
-        display_url = f"{self.base_url}/panier/panierDisplay.do"
-        display_headers = {
+        # Step 2: Navigate to Valorisation page (loads actual prices)
+        _log("info", "Requete panierValorisation.do...", "fetchEstimation")
+        valo_url = f"{self.base_url}/panier/panierValorisation.do"
+        valo_headers = {
             "Referer": set_url,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         try:
-            resp = self.session.get(display_url, headers=display_headers)
+            resp = self.session.get(valo_url, headers=valo_headers)
         except Exception as e:
-            _log("error", f"Exception panierDisplay: {e}", "fetchEstimation")
-            return FetchEstimationResponse(success=False, error=f"panierDisplay exception: {e}")
+            _log("error", f"Exception panierValorisation: {e}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"panierValorisation exception: {e}")
 
-        _log("info", f"panierDisplay status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
+        _log("info", f"panierValorisation status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
         if resp.status_code != 200:
-            _log("error", f"Echec panierDisplay HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
-            return FetchEstimationResponse(success=False, error=f"panierDisplay HTTP {resp.status_code}")
+            _log("error", f"Echec panierValorisation HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"panierValorisation HTTP {resp.status_code}")
 
         # Validate we got actual basket HTML (not an error page)
         html = resp.text
         if "panier" not in html.lower() and "DESIGNATION" not in html.upper() and "dossier" not in html.lower():
             _log("warn", f"Le HTML retourne ne ressemble pas au panier — premiers 500 chars: {html[:500]}", "fetchEstimation")
 
-        _log("info", f"panierDisplay OK — {len(html)} bytes, contient 'Dossier': {'Dossier' in html}, contient 'Total': {'Total' in html}", "fetchEstimation")
+        _log("info", f"panierValorisation OK — {len(html)} bytes, contient 'Dossier': {'Dossier' in html}, contient 'Total': {'Total' in html}", "fetchEstimation")
 
         return FetchEstimationResponse(success=True, html=html)
 
