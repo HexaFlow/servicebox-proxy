@@ -960,8 +960,8 @@ class ServiceBoxSession:
 
         _log("info", "panierSetCurrent OK", "fetchEstimation")
 
-        # Step 2: Navigate to Valorisation page (loads actual prices)
-        _log("info", "Requete panierValorisation.do...", "fetchEstimation")
+        # Step 2: Navigate to Valorisation page to trigger price computation
+        _log("info", "Requete panierValorisation.do (trigger prices)...", "fetchEstimation")
         valo_url = f"{self.base_url}/panier/panierValorisation.do"
         valo_headers = {
             "Referer": set_url,
@@ -975,15 +975,34 @@ class ServiceBoxSession:
 
         _log("info", f"panierValorisation status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
         if resp.status_code != 200:
-            _log("error", f"Echec panierValorisation HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
-            return FetchEstimationResponse(success=False, error=f"panierValorisation HTTP {resp.status_code}")
+            _log("warn", f"panierValorisation HTTP {resp.status_code} — continuing to printEstim anyway", "fetchEstimation")
 
-        # Validate we got actual basket HTML (not an error page)
+        # Step 3: Fetch estimation HTML (now with real prices after valorisation)
+        _log("info", "Requete printEstim.do...", "fetchEstimation")
+        estim_url = f"{self.base_url}/panier/printEstim.do"
+        estim_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": self.base_url,
+            "Referer": valo_url,
+            "Accept": "text/html, */*; q=0.01",
+        }
+        estim_body = "ldtIdSelected=0&typePrint=HTML&afficherRefPr=true&idAfficherRefPr=true"
+        try:
+            resp = self.session.post(estim_url, data=estim_body, headers=estim_headers)
+        except Exception as e:
+            _log("error", f"Exception printEstim: {e}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"printEstim exception: {e}")
+
+        _log("info", f"printEstim status={resp.status_code}, taille={len(resp.text)}", "fetchEstimation")
+        if resp.status_code != 200:
+            _log("error", f"Echec printEstim HTTP {resp.status_code} — body (500 premiers chars): {resp.text[:500]}", "fetchEstimation")
+            return FetchEstimationResponse(success=False, error=f"printEstim HTTP {resp.status_code}")
+
         html = resp.text
-        if "panier" not in html.lower() and "DESIGNATION" not in html.upper() and "dossier" not in html.lower():
-            _log("warn", f"Le HTML retourne ne ressemble pas au panier — premiers 500 chars: {html[:500]}", "fetchEstimation")
+        if "Estimation" not in html and "printEstim" not in html and "DESIGNATION" not in html.upper():
+            _log("warn", f"Le HTML retourne ne ressemble pas a une estimation — premiers 500 chars: {html[:500]}", "fetchEstimation")
 
-        _log("info", f"panierValorisation OK — {len(html)} bytes, contient 'Dossier': {'Dossier' in html}, contient 'Total': {'Total' in html}", "fetchEstimation")
+        _log("info", f"printEstim OK — {len(html)} bytes, contient 'Estimation': {'Estimation' in html}, contient 'Sous Total': {'Sous Total' in html}", "fetchEstimation")
 
         return FetchEstimationResponse(success=True, html=html)
 
